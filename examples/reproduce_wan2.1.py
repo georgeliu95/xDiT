@@ -25,6 +25,7 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 from xfuser.logger import init_logger
+from yunchang.kernels import AttnType
 
 from diffusers.utils import export_to_video, load_image
 
@@ -35,6 +36,21 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
 
 logger = init_logger(__name__)
+
+# Map argument to AttnType enum
+attn_impl_map = {
+    "torch": AttnType.TORCH,
+    "fa": AttnType.FA,
+    "fa3": AttnType.FA3,
+    "flashinfer": AttnType.FLASHINFER,
+    "sage_fp16": AttnType.SAGE_FP16,
+    "sage_fp8": AttnType.SAGE_FP8,
+    "sage_fp8_sm90": AttnType.SAGE_FP8_SM90,
+    "sage_fp16_triton": AttnType.SAGE_FP16_TRITON,
+    "sage_auto": AttnType.SAGE_AUTO,
+    "sparse_sage": AttnType.SPARSE_SAGE,
+}
+
 
 def pad_freqs(original_tensor, target_len, seq_dim_idx=-2):
     seq_len = original_tensor.shape[seq_dim_idx]
@@ -55,9 +71,10 @@ class xDiTWanAttnProcessor(WanAttnProcessor2_0):
     query and key vectors, but does not include spatial normalization.
     """
 
-    def __init__(self):
+    def __init__(self, attn_type: str = "fa"):
         super().__init__()
-        self.hybrid_seq_parallel_attn = xFuserLongContextAttention()
+        attn_impl = attn_impl_map[attn_type]
+        self.hybrid_seq_parallel_attn = xFuserLongContextAttention(attn_type=attn_impl)
 
     def __call__(
         self,
@@ -157,7 +174,8 @@ class xDiTWanAttnProcessor(WanAttnProcessor2_0):
 
 def parallelize_transformer(transformer: WanTransformer3DModel,
                             sp_size: int,
-                            sp_rank: int):
+                            sp_rank: int,
+                            attn_type: str = "fa"):
     @functools.wraps(transformer.__class__.forward)
     def new_forward(
         self,
@@ -224,9 +242,9 @@ def parallelize_transformer(transformer: WanTransformer3DModel,
 
         if sp_size > 1:
             for block in transformer.blocks:
-                block.attn1.processor = xDiTWanAttnProcessor()
+                block.attn1.processor = xDiTWanAttnProcessor(attn_type)
                 # [NOTE] USP is not verified yet with Cross-Attention
-                # block.attn2.processor = xDiTWanAttnProcessor()
+                # block.attn2.processor = xDiTWanAttnProcessor(attn_type)
 
         # Directly call the WanTransformer3DModel.blocks.forward
         block_rng = nvtx.start_range("dit.block", color="yellow")
@@ -339,7 +357,7 @@ def main(args):
     if args.blockwise_gemm:
         transformer = replace_blockwise_gemm(transformer)
 
-    parallelize_transformer(transformer, sp_size, sp_rank)
+    parallelize_transformer(transformer, sp_size, sp_rank, args.attn_type)
 
     pipe = WanImageToVideoPipeline.from_pretrained(
         pretrained_model_name_or_path=model_id,
@@ -405,8 +423,8 @@ def main(args):
     elapsed_time = end_time - start_time
     memory_peak = torch.cuda.max_memory_allocated(f"cuda:{local_rank}")
     print(f"Memory peak: {memory_peak / 1024**3:.2f} GB")
-    if local_rank == 0:
-        output_filename = f"xDiT.wan.output.sp{sp_size}"
+    if local_rank == 0 and not args.skip_saving_output:
+        output_filename = f"xDiT.wan.output.sp{sp_size}.{args.attn_type}"
         if args.blockwise_gemm:
             output_filename += ".blockwise_gemm"
         export_to_video(output, f"{output_filename}.mp4", fps=args.fps)
@@ -425,7 +443,9 @@ if __name__ == "__main__":
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--num_frames", type=int, default=81)
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--blockwise_gemm", action="store_true") 
+    parser.add_argument("--blockwise_gemm", action="store_true")
+    parser.add_argument("--attn_type", type=str, default="fa", help="Available choices: [torch, fa, fa3, flashinfer, sage_fp16, sage_fp8, sage_fp8_sm90, sage_fp16_triton, sage_auto, sparse_sage]")
+    parser.add_argument("--skip_saving_output", action="store_true")
     args = parser.parse_args()
 
     main(args)
