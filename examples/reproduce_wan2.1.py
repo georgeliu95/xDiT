@@ -288,6 +288,27 @@ def parallelize_transformer(transformer: WanTransformer3DModel,
     transformer.forward = new_forward
 
 
+def replace_blockwise_gemm(transformer: WanTransformer3DModel):
+    from linear_impl import VflyLinear
+    # Only replace the linear layers in Wan2.1TransformerBlock
+    model = transformer.blocks
+    replace_layers = []
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            tokens = name.strip().split('.')
+            layer = model
+            for t in tokens[:-1]:
+                if not t.isnumeric():
+                    layer = getattr(layer, t)
+                else:
+                    layer = layer[int(t)]
+            replace_layers.append([layer, tokens[-1], module])
+
+    for layer, name, module in replace_layers:
+        setattr(layer, name, VflyLinear.from_linear(module, linear_type="trtllm-fp8-blockwise"))
+    return transformer
+
+
 def main(args):
     dist.init_process_group("nccl")
     init_distributed_environment(rank=dist.get_rank(), world_size=dist.get_world_size())
@@ -315,6 +336,9 @@ def main(args):
     vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float16)
     transformer = WanTransformer3DModel.from_pretrained(model_id, subfolder="transformer", torch_dtype=torch.bfloat16).to(torch.bfloat16)
 
+    if args.blockwise_gemm:
+        transformer = replace_blockwise_gemm(transformer)
+
     parallelize_transformer(transformer, sp_size, sp_rank)
 
     pipe = WanImageToVideoPipeline.from_pretrained(
@@ -325,7 +349,11 @@ def main(args):
     )
     pipe.transformer = None
     pipe.to(f"cuda:{local_rank}")
-    pipe.transformer = shard_fn(transformer)
+    if args.ulysses_degree > 1 or args.ring_degree > 1:
+        pipe.transformer = shard_fn(transformer)
+    else:
+        pipe.transformer = transformer.to(f"cuda:{local_rank}")
+
     torch.cuda.empty_cache()
 
     image = load_image(
@@ -378,8 +406,11 @@ def main(args):
     memory_peak = torch.cuda.max_memory_allocated(f"cuda:{local_rank}")
     print(f"Memory peak: {memory_peak / 1024**3:.2f} GB")
     if local_rank == 0:
-        export_to_video(output, f"xDiT.wan.output.sp{sp_size}.mp4", fps=args.fps)
-        print(f"epoch time: {elapsed_time:.2f} sec; export video to xDiT.wan.output.sp{sp_size}.mp4")
+        output_filename = f"xDiT.wan.output.sp{sp_size}"
+        if args.blockwise_gemm:
+            output_filename += ".blockwise_gemm"
+        export_to_video(output, f"{output_filename}.mp4", fps=args.fps)
+        print(f"epoch time: {elapsed_time:.2f} sec; export video to {output_filename}.mp4")
     torch.cuda.empty_cache()
 
     dist.destroy_process_group()
@@ -394,6 +425,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--num_frames", type=int, default=81)
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--blockwise_gemm", action="store_true") 
     args = parser.parse_args()
 
     main(args)
