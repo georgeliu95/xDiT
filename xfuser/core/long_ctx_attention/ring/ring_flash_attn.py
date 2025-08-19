@@ -96,6 +96,8 @@ def xdit_ring_flash_attn_forward(
 
         if not causal or step <= comm.rank:
             fn = select_flash_attn_impl(attn_type, stage="fwd-only", attn_processor=attn_processor)
+            # FA: flash_attn_forward
+            # FA3: flash_attn3_func_forward
             if attn_type == AttnType.FA3: 
                 block_out, block_lse = fn(
                     q,
@@ -108,9 +110,9 @@ def xdit_ring_flash_attn_forward(
                     softcap=0.0,
                     alibi_slopes=alibi_slopes,
                     return_softmax=True and dropout_p > 0,
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale
+                    # q_descale=q_descale,
+                    # k_descale=k_descale,
+                    # v_descale=v_descale
                 )
             else:
                 block_out, block_lse = fn(
@@ -162,6 +164,9 @@ class xFuserRingFlashAttnFunc(RingFlashAttnFunc):
         joint_tensor_key,
         joint_tensor_value,
         joint_strategy,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
     ):
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.size(-1))
@@ -244,9 +249,9 @@ def xdit_ring_flash_attn_func(
             joint_tensor_key,
             joint_tensor_value,
             joint_strategy,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale
+            # q_descale,
+            # k_descale,
+            # v_descale
         )
     else:
         return xFuserRingFlashAttnFunc.apply(
