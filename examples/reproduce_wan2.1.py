@@ -1,4 +1,5 @@
 import sys
+import os
 import argparse
 import functools
 import types
@@ -14,8 +15,10 @@ from fsdp import shard_model, free_model
 from diffusers import WanImageToVideoPipeline, AutoencoderKLWan
 from diffusers.utils import USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_layers
 from transformers import CLIPVisionModel
+from datetime import timedelta
 
 import torch.distributed as dist
+from torch.distributed.elastic.multiprocessing.errors import record
 from xfuser.core.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
@@ -245,6 +248,9 @@ def parallelize_transformer(transformer: WanTransformer3DModel,
                 block.attn1.processor = xDiTWanAttnProcessor(attn_type)
                 # [NOTE] USP is not verified yet with Cross-Attention
                 # block.attn2.processor = xDiTWanAttnProcessor(attn_type)
+        else:
+            for block in transformer.blocks:
+                block.attn1.processor.attn_type = attn_type
 
         # Directly call the WanTransformer3DModel.blocks.forward
         block_rng = nvtx.start_range("dit.block", color="yellow")
@@ -327,11 +333,12 @@ def replace_blockwise_gemm(transformer: WanTransformer3DModel):
     return transformer
 
 
+@record
 def main(args):
-    dist.init_process_group("nccl")
+    dist.init_process_group("nccl", timeout=timedelta(seconds=1000))
     init_distributed_environment(rank=dist.get_rank(), world_size=dist.get_world_size())
-    local_rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    global_rank = dist.get_rank()
+    local_rank = global_rank % torch.cuda.device_count()
     torch.cuda.set_device(local_rank)
 
     if args.ulysses_degree > 1:
@@ -378,8 +385,8 @@ def main(args):
         "https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P/resolve/main/examples/i2v_input.JPG"
     )
     # image = image.resize((960, 1280), Image.LANCZOS)
-    # image = image.resize((1280, 720), resample=Image.Resampling.LANCZOS)
-    image = image.resize((480, 854), resample=Image.Resampling.LANCZOS)
+    image = image.resize((1280, 720), resample=Image.Resampling.LANCZOS)
+    # image = image.resize((480, 854), resample=Image.Resampling.LANCZOS)
     max_area = np.prod(image.size)
     aspect_ratio = image.height / image.width
     mod_value = pipe.vae_scale_factor_spatial * pipe.transformer.config.patch_size[1]
@@ -403,9 +410,12 @@ def main(args):
     torch.cuda.synchronize()
     start_time = time.time()
 
-    print(f"cuda:{local_rank} memory summary:\n{torch.cuda.memory_summary(device=f'cuda:{local_rank}', abbreviated=False)}")
+    # print(f"cuda:{local_rank} memory summary:\n{torch.cuda.memory_summary(device=f'cuda:{local_rank}', abbreviated=False)}")
+    if local_rank == 0:
+        print(pipe.transformer)
 
     with torch.no_grad():
+        pipeline_rng = nvtx.start_range("pipeline", color="blue")
         output = pipe(
             image=image,
             prompt=prompt,
@@ -417,6 +427,7 @@ def main(args):
             num_inference_steps=args.num_inference_steps,
             generator=torch.Generator(device="cuda").manual_seed(42),
         ).frames[0]
+        nvtx.end_range(pipeline_rng)
 
     torch.cuda.synchronize()
     end_time = time.time()
