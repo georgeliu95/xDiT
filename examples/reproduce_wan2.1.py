@@ -10,6 +10,9 @@ import nvtx
 import time
 import torch
 import numpy as np
+import psutil
+import gc
+
 from PIL import Image
 from fsdp import shard_model, free_model
 from diffusers import WanImageToVideoPipeline, AutoencoderKLWan
@@ -37,6 +40,7 @@ from diffusers.models.transformers.transformer_wan import WanAttnProcessor2_0, W
 from diffusers.models.embeddings import apply_rotary_emb
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
+from linear_impl import replace_linear_layer
 
 logger = init_logger(__name__)
 
@@ -53,6 +57,50 @@ attn_impl_map = {
     "sage_auto": AttnType.SAGE_AUTO,
     "sparse_sage": AttnType.SPARSE_SAGE,
 }
+
+
+def get_system_memory_info(key: str = None):
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    if key is None:
+        return mem_info
+    elif key == "available":
+        with open('/proc/meminfo', 'r') as f:
+            meminfo = f.read()
+            for line in meminfo.split('\n'):
+                if 'MemAvailable' in line:
+                    mem_available_kb = int(line.split()[1])
+                    mem_available_gb = mem_available_kb / 1024**2
+                    break
+        return mem_available_gb
+    else:
+        info = getattr(mem_info, key.lower(), None)
+        assert info is not None, f"Invalid key for memory info: {key}"
+        return info / 1024**3
+
+
+def print_memory_usage(stage_name, rank):
+    """Print the memory usage of the current process"""
+    if rank != 0:
+        return
+    
+    # Get the current process
+    process = psutil.Process(os.getpid())
+    
+    # Process RSS memory
+    mem_info = process.memory_info()
+    rss_gb = mem_info.rss / 1024**3  # RSS in GB
+    
+    # System available memory
+    mem_available_gb = get_system_memory_info("available")
+    
+    # GPU allocated memory and reserved memory
+    if torch.cuda.is_available():
+        gpu_mem_allocated = torch.cuda.memory_allocated() / 1024**3
+        gpu_mem_reserved = torch.cuda.memory_reserved() / 1024**3
+        logger.info(f"[{stage_name}] Rank 0 Memory - Process RSS: {rss_gb:.2f}GB, System Available: {mem_available_gb:.2f}GB, GPU Allocated: {gpu_mem_allocated:.2f}GB, GPU Reserved: {gpu_mem_reserved:.2f}GB")
+    else:
+        logger.info(f"[{stage_name}] Rank 0 Memory - Process RSS: {rss_gb:.2f}GB, System Available: {mem_available_gb:.2f}GB")
 
 
 def pad_freqs(original_tensor, target_len, seq_dim_idx=-2):
@@ -79,6 +127,7 @@ class xDiTWanAttnProcessor(WanAttnProcessor2_0):
         attn_impl = attn_impl_map[attn_type]
         self.hybrid_seq_parallel_attn = xFuserLongContextAttention(attn_type=attn_impl)
 
+    @nvtx.annotate(message="xDiTWanAttnProcessor.__call__", color="red")
     def __call__(
         self,
         attn: Attention,
@@ -97,9 +146,10 @@ class xDiTWanAttnProcessor(WanAttnProcessor2_0):
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
 
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(encoder_hidden_states)
-        value = attn.to_v(encoder_hidden_states)
+        with nvtx.annotate(message="qkv", color="red"):
+            query = attn.to_q(hidden_states)
+            key = attn.to_k(encoder_hidden_states)
+            value = attn.to_v(encoder_hidden_states)
 
         if attn.norm_q is not None:
             query = attn.norm_q(query)
@@ -135,32 +185,30 @@ class xDiTWanAttnProcessor(WanAttnProcessor2_0):
             key_img = key_img.transpose(1, 2)
             value_img = value_img.transpose(1, 2)
 
-            attn_rng = nvtx.start_range("hybrid_seq_parallel_attn", color="red")
-            hidden_states_img = self.hybrid_seq_parallel_attn(
-                None,
-                query,
-                key_img,
-                value_img,
-                dropout_p=0.0,
-                causal=False,
-            )
-            nvtx.end_range(attn_rng)
+            with nvtx.annotate(message="hybrid_seq_parallel_attn_img", color="red"):
+                hidden_states_img = self.hybrid_seq_parallel_attn(
+                    None,
+                    query,
+                    key_img,
+                    value_img,
+                    dropout_p=0.0,
+                    causal=False,
+                )
             hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
 
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
-        attn_rng = nvtx.start_range("hybrid_seq_parallel_attn", color="red")
-        hidden_states = self.hybrid_seq_parallel_attn(
-            None,
-            query,
-            key,
-            value,
-            dropout_p=0.0,
-            causal=False,
-        )
-        nvtx.end_range(attn_rng)
+        with nvtx.annotate(message="hybrid_seq_parallel_attn", color="red"):
+            hidden_states = self.hybrid_seq_parallel_attn(
+                None,
+                query,
+                key,
+                value,
+                dropout_p=0.0,
+                causal=False,
+            )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 
@@ -312,30 +360,10 @@ def parallelize_transformer(transformer: WanTransformer3DModel,
     transformer.forward = new_forward
 
 
-def replace_blockwise_gemm(transformer: WanTransformer3DModel):
-    from linear_impl import VflyLinear
-    # Only replace the linear layers in Wan2.1TransformerBlock
-    model = transformer.blocks
-    replace_layers = []
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear):
-            tokens = name.strip().split('.')
-            layer = model
-            for t in tokens[:-1]:
-                if not t.isnumeric():
-                    layer = getattr(layer, t)
-                else:
-                    layer = layer[int(t)]
-            replace_layers.append([layer, tokens[-1], module])
-
-    for layer, name, module in replace_layers:
-        setattr(layer, name, VflyLinear.from_linear(module, linear_type="trtllm-fp8-blockwise"))
-    return transformer
-
-
 @record
 def main(args):
-    dist.init_process_group("nccl", timeout=timedelta(seconds=1000))
+    # Increase timeout because rank 0 needs to pre-download all model files
+    dist.init_process_group("nccl", timeout=timedelta(seconds=3600))
     init_distributed_environment(rank=dist.get_rank(), world_size=dist.get_world_size())
     global_rank = dist.get_rank()
     local_rank = global_rank % torch.cuda.device_count()
@@ -355,38 +383,191 @@ def main(args):
     shard_fn = partial(shard_model, device_id=local_rank)
 
     model_id = args.model_id
-    image_encoder = CLIPVisionModel.from_pretrained(
-        model_id, subfolder="image_encoder", torch_dtype=torch.float16
-    )
-    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float16)
-    transformer = WanTransformer3DModel.from_pretrained(model_id, subfolder="transformer", torch_dtype=torch.bfloat16).to(torch.bfloat16)
+    
+    # Let rank 0 download all model files to HuggingFace cache to avoid timeout due to multiple ranks downloading simultaneously
+    if dist.is_initialized():
+        if global_rank == 0:
+            logger.info(f"Rank 0: Pre-downloading all components to cache...")
+            # 1. Download image_encoder
+            temp_model = CLIPVisionModel.from_pretrained(
+                model_id, subfolder="image_encoder", torch_dtype=torch.float16
+            )
+            del temp_model
+            gc.collect()
+            
+            # 2. Download vae
+            temp_model = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float16)
+            del temp_model
+            gc.collect()
+            
+            # 3. Download transformer
+            temp_model = WanTransformer3DModel.from_pretrained(model_id, subfolder="transformer", torch_dtype=torch.bfloat16)
+            del temp_model
+            gc.collect()
+            
+            # 4. Download pipeline other components (text_encoder, etc.)
+            logger.info(f"Rank 0: Pre-downloading pipeline components...")
+            temp_pipe = WanImageToVideoPipeline.from_pretrained(
+                model_id,
+                transformer=None,  # Do not load transformer to save memory
+                vae=None,
+                image_encoder=None,
+                torch_dtype=torch.bfloat16,
+            )
+            del temp_pipe
+            gc.collect()
+            
+            logger.info(f"Rank 0: All components downloaded to cache and memory released")
+            print_memory_usage("After pre-download", global_rank)
+        # Wait for rank 0 to complete download
+        dist.barrier()
+        logger.info(f"Rank {global_rank}: Starting to load models from cache...")
 
-    if args.blockwise_gemm:
-        transformer = replace_blockwise_gemm(transformer)
+    # Load models in a staggered manner: each rank loads sequentially to avoid OOM
+    # After each rank loads, wait for the next rank to start loading
+    if dist.is_initialized() and get_system_memory_info("available") < 500:
+        for i in range(dist.get_world_size()):
+            if i == global_rank:
+                logger.info(f"Rank {global_rank}: Loading models...")
+                image_encoder = CLIPVisionModel.from_pretrained(
+                    model_id, subfolder="image_encoder", torch_dtype=torch.float16
+                )
+                vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float16)
+                transformer = WanTransformer3DModel.from_pretrained(model_id, subfolder="transformer", torch_dtype=torch.bfloat16).to(torch.bfloat16)
+                logger.info(f"Rank {global_rank}: Models loaded successfully")
+                print_memory_usage(f"After loading models (Rank {global_rank})", global_rank)
+            dist.barrier()
+    else:
+        image_encoder = CLIPVisionModel.from_pretrained(
+            model_id, subfolder="image_encoder", torch_dtype=torch.float16
+        )
+        vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float16)
+        transformer = WanTransformer3DModel.from_pretrained(model_id, subfolder="transformer", torch_dtype=torch.bfloat16).to(torch.bfloat16)
+
+    # Before quantization, move VAE and image_encoder to GPU to free CPU memory
+    if args.quant_gemm_type is not None and args.quant_gemm_type != "bf16":
+        if dist.is_initialized() and get_system_memory_info("available") < 500:
+            # First stagger the movement of small models to GPU
+            for i in range(dist.get_world_size()):
+                if i == global_rank:
+                    logger.info(f"Rank {global_rank}: Moving VAE and image_encoder to GPU before quantization...")
+                    vae = vae.to(f"cuda:{local_rank}")
+                    image_encoder = image_encoder.to(f"cuda:{local_rank}")
+                    torch.cuda.empty_cache()
+                    logger.info(f"Rank {global_rank}: VAE and image_encoder moved to GPU, CPU memory freed for quantization")
+                    print_memory_usage(f"Before quantization (Rank {global_rank})", global_rank)
+                dist.barrier()
+    
+    # Stagger the quantization conversion (if needed)
+    # Strategy: when one rank quantizes, other ranks move the transformer to GPU to free CPU memory
+    if args.quant_gemm_type is not None:
+        assert args.quant_gemm_type in ["bf16", "nvfp4", "svdquant.nvfp4", "trtllm-fp8-blockwise", "nvfp4+trtllm-fp8-blockwise"], "Invalid quant_gemm_type"
+        if args.quant_gemm_type != "bf16":
+            if dist.is_initialized() and get_system_memory_info("available") < 500:
+                transformer_on_gpu = False
+                for i in range(dist.get_world_size()):
+                    if i == global_rank:
+                        # If on GPU, move back to CPU
+                        if transformer_on_gpu:
+                            logger.info(f"Rank {global_rank}: Moving transformer back to CPU for quantization...")
+                            transformer = transformer.cpu()
+                            torch.cuda.empty_cache()
+                        
+                        print_memory_usage(f"Before quantization (Rank {global_rank})", global_rank)
+                        # Current rank performs quantization
+                        logger.info(f"Rank {global_rank}: Applying quantization ({args.quant_gemm_type})...")
+                        transformer = replace_linear_layer(transformer, quant_gemm_type=args.quant_gemm_type)
+                        logger.info(f"Rank {global_rank}: Quantization completed, moving to GPU...")
+                        transformer = transformer.to(f"cuda:{local_rank}")
+                        torch.cuda.empty_cache()
+                        transformer_on_gpu = True
+                        logger.info(f"Rank {global_rank}: Quantized transformer on GPU")
+                        print_memory_usage(f"After quantization (Rank {global_rank})", global_rank)
+                    elif not transformer_on_gpu and i == 0:
+                        # On the first round, other ranks move the unquantized transformer to GPU to free CPU memory
+                        logger.info(f"Rank {global_rank}: Temporarily moving transformer to GPU to free CPU memory...")
+                        transformer = transformer.to(f"cuda:{local_rank}")
+                        torch.cuda.synchronize()
+                        transformer_on_gpu = True
+                        logger.info(f"Rank {global_rank}: Transformer temporarily on GPU")
+                    
+                    dist.barrier()
+            else:
+                transformer = replace_linear_layer(transformer, quant_gemm_type=args.quant_gemm_type)
 
     parallelize_transformer(transformer, sp_size, sp_rank, args.attn_type)
 
-    pipe = WanImageToVideoPipeline.from_pretrained(
-        pretrained_model_name_or_path=model_id,
-        vae=vae.to(f"cuda:{local_rank}"),
-        image_encoder=image_encoder.to(f"cuda:{local_rank}"),
-        torch_dtype=torch.bfloat16,
-    )
-    pipe.transformer = None
-    pipe.to(f"cuda:{local_rank}")
-    if args.ulysses_degree > 1 or args.ring_degree > 1:
-        pipe.transformer = shard_fn(transformer)
+    # Stagger the movement of loaded models to GPU to free CPU memory, then create pipeline
+    if dist.is_initialized() and get_system_memory_info("available") < 500:
+        # If there is no quantization, or bf16, move VAE and image_encoder to GPU
+        if args.quant_gemm_type is None or args.quant_gemm_type == "bf16":
+            for i in range(dist.get_world_size()):
+                if i == global_rank:
+                    logger.info(f"Rank {global_rank}: Moving VAE and image_encoder to GPU...")
+                    vae = vae.to(f"cuda:{local_rank}")
+                    image_encoder = image_encoder.to(f"cuda:{local_rank}")
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    logger.info(f"Rank {global_rank}: VAE and image_encoder moved to GPU")
+                    print_memory_usage(f"After moving VAE/encoder to GPU (Rank {global_rank})", global_rank)
+                dist.barrier()
+        else:
+            logger.info(f"Rank {global_rank}: VAE and image_encoder already on GPU (moved before quantization)")
+        
+        # All ranks process transformer simultaneously (FSDP needs synchronization)
+        logger.info(f"Rank {global_rank}: Moving transformer to GPU and applying FSDP...")
+        transformer = transformer.to(f"cuda:{local_rank}")
+        torch.cuda.synchronize()
+        logger.info(f"Rank {global_rank}: Transformer moved to GPU")
+        
+        if args.ulysses_degree > 1 or args.ring_degree > 1:
+            logger.info(f"Rank {global_rank}: Applying FSDP sharding (all ranks synchronized)...")
+            transformer = shard_fn(transformer)
+            logger.info(f"Rank {global_rank}: FSDP sharding completed")
+        
+        torch.cuda.empty_cache()
+        logger.info(f"Rank {global_rank}: Transformer processing done")
+        print_memory_usage(f"After transformer to GPU (Rank {global_rank})", global_rank)
+        dist.barrier()
+        
+        # Now CPU memory is released, stagger the creation of pipeline (will load text_encoder, etc.)
+        for i in range(dist.get_world_size()):
+            if i == global_rank:
+                logger.info(f"Rank {global_rank}: Creating pipeline...")
+                pipe = WanImageToVideoPipeline.from_pretrained(
+                    pretrained_model_name_or_path=model_id,
+                    vae=vae,  # Already on GPU
+                    image_encoder=image_encoder,  # Already on GPU
+                    torch_dtype=torch.bfloat16,
+                )
+                pipe.transformer = transformer  # Already on GPU
+                pipe.to(f"cuda:{local_rank}")
+                torch.cuda.empty_cache()
+                logger.info(f"Rank {global_rank}: Pipeline created successfully")
+                print_memory_usage(f"After creating pipeline (Rank {global_rank})", global_rank)
+            dist.barrier()
     else:
-        pipe.transformer = transformer.to(f"cuda:{local_rank}")
-
-    torch.cuda.empty_cache()
+        pipe = WanImageToVideoPipeline.from_pretrained(
+            pretrained_model_name_or_path=model_id,
+            vae=vae.to(f"cuda:{local_rank}"),
+            image_encoder=image_encoder.to(f"cuda:{local_rank}"),
+            torch_dtype=torch.bfloat16,
+        )
+        pipe.transformer = None
+        pipe.to(f"cuda:{local_rank}")
+        if args.ulysses_degree > 1 or args.ring_degree > 1:
+            pipe.transformer = shard_fn(transformer)
+        else:
+            pipe.transformer = transformer.to(f"cuda:{local_rank}")
+        torch.cuda.empty_cache()
 
     image = load_image(
         "https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P/resolve/main/examples/i2v_input.JPG"
     )
     # image = image.resize((960, 1280), Image.LANCZOS)
-    image = image.resize((1280, 720), resample=Image.Resampling.LANCZOS)
+    # image = image.resize((1280, 720), resample=Image.Resampling.LANCZOS)
     # image = image.resize((480, 854), resample=Image.Resampling.LANCZOS)
+    image = image.resize((720, 1280), resample=Image.Resampling.LANCZOS)
     max_area = np.prod(image.size)
     aspect_ratio = image.height / image.width
     mod_value = pipe.vae_scale_factor_spatial * pipe.transformer.config.patch_size[1]
@@ -410,7 +591,6 @@ def main(args):
     torch.cuda.synchronize()
     start_time = time.time()
 
-    # print(f"cuda:{local_rank} memory summary:\n{torch.cuda.memory_summary(device=f'cuda:{local_rank}', abbreviated=False)}")
     if local_rank == 0:
         print(pipe.transformer)
 
@@ -425,7 +605,7 @@ def main(args):
             num_frames=args.num_frames,
             guidance_scale=5.0,
             num_inference_steps=args.num_inference_steps,
-            generator=torch.Generator(device="cuda").manual_seed(42),
+            generator=torch.Generator(device="cuda").manual_seed(999),
         ).frames[0]
         nvtx.end_range(pipeline_rng)
 
@@ -436,8 +616,8 @@ def main(args):
     print(f"Memory peak: {memory_peak / 1024**3:.2f} GB")
     if local_rank == 0 and not args.skip_saving_output:
         output_filename = f"xDiT.wan.output.sp{sp_size}.{args.attn_type}"
-        if args.blockwise_gemm:
-            output_filename += ".blockwise_gemm"
+        if args.quant_gemm_type is not None:
+            output_filename += f".{args.quant_gemm_type}"
         export_to_video(output, f"{output_filename}.mp4", fps=args.fps)
         print(f"epoch time: {elapsed_time:.2f} sec; export video to {output_filename}.mp4")
     torch.cuda.empty_cache()
@@ -454,7 +634,9 @@ if __name__ == "__main__":
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--num_frames", type=int, default=81)
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--blockwise_gemm", action="store_true")
+    parser.add_argument("--quant_gemm_type", 
+                        type=str, default=None, 
+                        help="Available choices: [bf16 (default, no quantization), nvfp4, svdquant.nvfp4, trtllm-fp8-blockwise, nvfp4+trtllm-fp8-blockwise]")
     parser.add_argument("--attn_type", type=str, default="fa", help="Available choices: [torch, fa, fa3, flashinfer, sage_fp16, sage_fp8, sage_fp8_sm90, sage_fp16_triton, sage_auto, sparse_sage]")
     parser.add_argument("--skip_saving_output", action="store_true")
     args = parser.parse_args()
