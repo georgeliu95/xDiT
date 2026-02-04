@@ -15,7 +15,7 @@ import gc
 
 from PIL import Image
 from fsdp import shard_model, free_model
-from diffusers import WanImageToVideoPipeline, AutoencoderKLWan
+from diffusers import WanPipeline, AutoencoderKLWan
 from diffusers.utils import USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_layers
 from transformers import CLIPVisionModel
 from datetime import timedelta
@@ -46,7 +46,7 @@ logger = init_logger(__name__)
 
 # Map argument to AttnType enum
 attn_impl_map = {
-    #"torch": AttnType.TORCH_FLASH,
+    # "torch": AttnType.TORCH,
     "fa": AttnType.FA,
     "fa3": AttnType.FA3,
     "flashinfer": AttnType.FLASHINFER,
@@ -407,7 +407,7 @@ def main(args):
             
             # 4. Download pipeline other components (text_encoder, etc.)
             logger.info(f"Rank 0: Pre-downloading pipeline components...")
-            temp_pipe = WanImageToVideoPipeline.from_pretrained(
+            temp_pipe = WanPipeline.from_pretrained(
                 model_id,
                 transformer=None,  # Do not load transformer to save memory
                 vae=None,
@@ -534,7 +534,7 @@ def main(args):
         for i in range(dist.get_world_size()):
             if i == global_rank:
                 logger.info(f"Rank {global_rank}: Creating pipeline...")
-                pipe = WanImageToVideoPipeline.from_pretrained(
+                pipe = WanPipeline.from_pretrained(
                     pretrained_model_name_or_path=model_id,
                     vae=vae,  # Already on GPU
                     image_encoder=image_encoder,  # Already on GPU
@@ -547,7 +547,7 @@ def main(args):
                 print_memory_usage(f"After creating pipeline (Rank {global_rank})", global_rank)
             dist.barrier()
     else:
-        pipe = WanImageToVideoPipeline.from_pretrained(
+        pipe = WanPipeline.from_pretrained(
             pretrained_model_name_or_path=model_id,
             vae=vae.to(f"cuda:{local_rank}"),
             image_encoder=image_encoder.to(f"cuda:{local_rank}"),
@@ -561,19 +561,20 @@ def main(args):
             pipe.transformer = transformer.to(f"cuda:{local_rank}")
         torch.cuda.empty_cache()
 
-    image = load_image(
-        "https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P/resolve/main/examples/i2v_input.JPG"
-    )
-    # image = image.resize((960, 1280), Image.LANCZOS)
-    # image = image.resize((1280, 720), resample=Image.Resampling.LANCZOS)
-    # image = image.resize((480, 854), resample=Image.Resampling.LANCZOS)
-    image = image.resize((720, 1280), resample=Image.Resampling.LANCZOS)
-    max_area = np.prod(image.size)
-    aspect_ratio = image.height / image.width
-    mod_value = pipe.vae_scale_factor_spatial * pipe.transformer.config.patch_size[1]
-    height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-    width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
-    image = image.resize((width, height))
+    # image = load_image(
+    #     # "https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P/resolve/main/examples/i2v_input.JPG"
+    #     "./cat_robot.png"
+    # )
+    # # image = image.resize((960, 1280), Image.LANCZOS)
+    # # image = image.resize((1280, 720), resample=Image.Resampling.LANCZOS)
+    # # image = image.resize((480, 854), resample=Image.Resampling.LANCZOS)
+    # image = image.resize((720, 1280), resample=Image.Resampling.LANCZOS)
+    # max_area = np.prod(image.size)
+    # aspect_ratio = image.height / image.width
+    # mod_value = pipe.vae_scale_factor_spatial * pipe.transformer.config.patch_size[1]
+    # height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+    # width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+    # image = image.resize((width, height))
 
     prompt = (
         "Summer beach vacation style, a white cat wearing sunglasses \
@@ -597,11 +598,11 @@ def main(args):
     with torch.no_grad():
         pipeline_rng = nvtx.start_range("pipeline", color="blue")
         output = pipe(
-            image=image,
+            # image=image,
             prompt=prompt,
             negative_prompt=negative_prompt,
-            height=height,
-            width=width,
+            height=832,
+            width=480,
             num_frames=args.num_frames,
             guidance_scale=5.0,
             num_inference_steps=args.num_inference_steps,
