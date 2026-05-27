@@ -56,7 +56,7 @@ DIT_PARALLEL_SIZE=1
 # It is necessary to set CUDA_VISIBLE_DEVICES for the ray driver and workers.
 export CUDA_VISIBLE_DEVICES=4,5,6,7
 
-python ./examples/ray/$SCRIPT \
+python ./examples/ray_examples/$SCRIPT \
 --model $MODEL_ID \
 $PARALLEL_ARGS \
 $TASK_ARGS \
