@@ -11,4 +11,7 @@ xfuser.egg-info/
 dist/*
 *.mp4
 *.nsys-rep
+*.ncu-rep
 *.png
+examples/ncu/
+examples/nsys/
