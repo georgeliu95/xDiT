@@ -4,7 +4,10 @@ from torch.nn import functional as F
 
 import torch.distributed._functional_collectives as ft_c
 
-from torch.distributed.tensor.experimental._attention import _templated_ring_attention
+try:
+    from torch.distributed.tensor.experimental._attention import _templated_ring_attention
+except ImportError:
+    _templated_ring_attention = None
 
 from yunchang.globals import PROCESS_GROUP
 
@@ -22,9 +25,19 @@ aten = torch.ops.aten
 
     
 def ring_attn(query, key, value, dropout_p=0.0, is_causal=False):
+    if _templated_ring_attention is None:
+        raise RuntimeError(
+            "torch.distributed.tensor.experimental._attention._templated_ring_attention "
+            "is not available in this PyTorch build. Ring parallel attention requires "
+            "a PyTorch version that still exposes this private API."
+        )
     if torch.__version__ >= "2.6.0":
-        from torch.distributed.tensor.experimental._attention import _cp_options
-        _cp_options.enable_load_balance = False
+        try:
+            from torch.distributed.tensor.experimental._attention import _cp_options
+
+            _cp_options.enable_load_balance = False
+        except ImportError:
+            pass
         kwargs = {
             "dropout_p": dropout_p,
             "is_causal": is_causal,
