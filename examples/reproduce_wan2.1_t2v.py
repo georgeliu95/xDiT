@@ -17,7 +17,6 @@ from PIL import Image
 from fsdp import shard_model, free_model
 from diffusers import WanPipeline, AutoencoderKLWan
 from diffusers.utils import USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_layers
-from transformers import CLIPVisionModel
 from datetime import timedelta
 
 import torch.distributed as dist
@@ -103,17 +102,35 @@ def print_memory_usage(stage_name, rank):
         logger.info(f"[{stage_name}] Rank 0 Memory - Process RSS: {rss_gb:.2f}GB, System Available: {mem_available_gb:.2f}GB")
 
 
-def pad_freqs(original_tensor, target_len, seq_dim_idx=-2):
+def pad_freqs(original_tensor, target_len, seq_dim_idx=-2, pad_value=1):
     seq_len = original_tensor.shape[seq_dim_idx]
     pad_size = target_len - seq_len
-    padding_tensor = torch.ones(
+    if pad_size <= 0:
+        return original_tensor
+    padding_shape = (
         *original_tensor.shape[:seq_dim_idx],
         pad_size,
         *original_tensor.shape[seq_dim_idx+1:],
-        dtype=original_tensor.dtype,
-        device=original_tensor.device)
+    )
+    padding_tensor = original_tensor.new_full(padding_shape, pad_value)
     padded_tensor = torch.cat([original_tensor, padding_tensor], dim=seq_dim_idx)
     return padded_tensor
+
+
+def pad_rotary_emb(rotary_emb, target_len, seq_dim_idx=-2):
+    if isinstance(rotary_emb, tuple):
+        freqs_cos, freqs_sin = rotary_emb
+        return (
+            pad_freqs(freqs_cos, target_len, seq_dim_idx=1, pad_value=1),
+            pad_freqs(freqs_sin, target_len, seq_dim_idx=1, pad_value=0),
+        )
+    return pad_freqs(rotary_emb, target_len, seq_dim_idx=seq_dim_idx)
+
+
+def chunk_rotary_emb(rotary_emb, chunks, rank, seq_dim_idx=-2):
+    if isinstance(rotary_emb, tuple):
+        return tuple(torch.chunk(freqs, chunks, dim=1)[rank] for freqs in rotary_emb)
+    return torch.chunk(rotary_emb, chunks, dim=seq_dim_idx)[rank]
 
 
 class xDiTWanAttnProcessor(WanAttnProcessor2_0):
@@ -134,7 +151,7 @@ class xDiTWanAttnProcessor(WanAttnProcessor2_0):
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        rotary_emb: Optional[torch.Tensor] = None,
+        rotary_emb: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> torch.Tensor:
         assert attention_mask is None, "attention_mask is not supported for xDiT"
 
@@ -162,7 +179,21 @@ class xDiTWanAttnProcessor(WanAttnProcessor2_0):
 
         if rotary_emb is not None:
 
-            def apply_rotary_emb(hidden_states: torch.Tensor, freqs: torch.Tensor):
+            def apply_rotary_emb(
+                hidden_states: torch.Tensor,
+                freqs: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+            ):
+                if isinstance(freqs, tuple):
+                    freqs_cos, freqs_sin = freqs
+                    hidden_states = hidden_states.transpose(1, 2)
+                    x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
+                    cos = freqs_cos[..., 0::2]
+                    sin = freqs_sin[..., 1::2]
+                    out = torch.empty_like(hidden_states)
+                    out[..., 0::2] = x1 * cos - x2 * sin
+                    out[..., 1::2] = x1 * sin + x2 * cos
+                    return out.type_as(hidden_states).transpose(1, 2)
+
                 x_rotated = torch.view_as_complex(hidden_states.to(torch.float64).unflatten(3, (-1, 2)))
                 x_out = torch.view_as_real(x_rotated * freqs).flatten(3, 4)
                 return x_out.type_as(hidden_states)
@@ -288,8 +319,8 @@ def parallelize_transformer(transformer: WanTransformer3DModel,
             hidden_states, sp_size, dim=seq_dim_idx)[sp_rank]
         max_seq_len = (original_seq_len + sp_size - 1) // sp_size
 
-        rotary_emb = pad_freqs(rotary_emb, max_seq_len * sp_size, seq_dim_idx=seq_dim_idx)
-        rotary_emb = torch.chunk(rotary_emb, sp_size, dim=seq_dim_idx)[sp_rank]
+        rotary_emb = pad_rotary_emb(rotary_emb, max_seq_len * sp_size, seq_dim_idx=seq_dim_idx)
+        rotary_emb = chunk_rotary_emb(rotary_emb, sp_size, sp_rank, seq_dim_idx=seq_dim_idx)
 
         if sp_size > 1:
             for block in transformer.blocks:
@@ -388,30 +419,22 @@ def main(args):
     if dist.is_initialized():
         if global_rank == 0:
             logger.info(f"Rank 0: Pre-downloading all components to cache...")
-            # 1. Download image_encoder
-            temp_model = CLIPVisionModel.from_pretrained(
-                model_id, subfolder="image_encoder", torch_dtype=torch.float16
-            )
-            del temp_model
-            gc.collect()
-            
-            # 2. Download vae
+            # 1. Download vae
             temp_model = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float16)
             del temp_model
             gc.collect()
             
-            # 3. Download transformer
+            # 2. Download transformer
             temp_model = WanTransformer3DModel.from_pretrained(model_id, subfolder="transformer", torch_dtype=torch.bfloat16)
             del temp_model
             gc.collect()
             
-            # 4. Download pipeline other components (text_encoder, etc.)
+            # 3. Download pipeline other components (text_encoder, etc.)
             logger.info(f"Rank 0: Pre-downloading pipeline components...")
             temp_pipe = WanPipeline.from_pretrained(
                 model_id,
                 transformer=None,  # Do not load transformer to save memory
                 vae=None,
-                image_encoder=None,
                 torch_dtype=torch.bfloat16,
             )
             del temp_pipe
@@ -429,39 +452,32 @@ def main(args):
         for i in range(dist.get_world_size()):
             if i == global_rank:
                 logger.info(f"Rank {global_rank}: Loading models...")
-                image_encoder = CLIPVisionModel.from_pretrained(
-                    model_id, subfolder="image_encoder", torch_dtype=torch.float16
-                )
                 vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float16)
                 transformer = WanTransformer3DModel.from_pretrained(model_id, subfolder="transformer", torch_dtype=torch.bfloat16).to(torch.bfloat16)
                 logger.info(f"Rank {global_rank}: Models loaded successfully")
                 print_memory_usage(f"After loading models (Rank {global_rank})", global_rank)
             dist.barrier()
     else:
-        image_encoder = CLIPVisionModel.from_pretrained(
-            model_id, subfolder="image_encoder", torch_dtype=torch.float16
-        )
         vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float16)
         transformer = WanTransformer3DModel.from_pretrained(model_id, subfolder="transformer", torch_dtype=torch.bfloat16).to(torch.bfloat16)
 
-    # Before quantization, move VAE and image_encoder to GPU to free CPU memory
+    # Before quantization, move VAE to GPU to free CPU memory
     if args.quant_gemm_type is not None and args.quant_gemm_type != "bf16":
         if dist.is_initialized() and get_system_memory_info("available") < 500:
-            # First stagger the movement of small models to GPU
+            # First stagger the movement of the VAE to GPU
             for i in range(dist.get_world_size()):
                 if i == global_rank:
-                    logger.info(f"Rank {global_rank}: Moving VAE and image_encoder to GPU before quantization...")
+                    logger.info(f"Rank {global_rank}: Moving VAE to GPU before quantization...")
                     vae = vae.to(f"cuda:{local_rank}")
-                    image_encoder = image_encoder.to(f"cuda:{local_rank}")
                     torch.cuda.empty_cache()
-                    logger.info(f"Rank {global_rank}: VAE and image_encoder moved to GPU, CPU memory freed for quantization")
+                    logger.info(f"Rank {global_rank}: VAE moved to GPU, CPU memory freed for quantization")
                     print_memory_usage(f"Before quantization (Rank {global_rank})", global_rank)
                 dist.barrier()
     
     # Stagger the quantization conversion (if needed)
     # Strategy: when one rank quantizes, other ranks move the transformer to GPU to free CPU memory
     if args.quant_gemm_type is not None:
-        assert args.quant_gemm_type in ["bf16", "nvfp4", "svdquant.nvfp4", "trtllm-fp8-blockwise", "nvfp4+trtllm-fp8-blockwise"], "Invalid quant_gemm_type"
+        assert args.quant_gemm_type in ["bf16", "nvfp4", "trtllm-fp8-blockwise", "nvfp4+trtllm-fp8-blockwise"], "Invalid quant_gemm_type"
         if args.quant_gemm_type != "bf16":
             if dist.is_initialized() and get_system_memory_info("available") < 500:
                 transformer_on_gpu = False
@@ -476,7 +492,12 @@ def main(args):
                         print_memory_usage(f"Before quantization (Rank {global_rank})", global_rank)
                         # Current rank performs quantization
                         logger.info(f"Rank {global_rank}: Applying quantization ({args.quant_gemm_type})...")
-                        transformer = replace_linear_layer(transformer, quant_gemm_type=args.quant_gemm_type)
+                        transformer = replace_linear_layer(
+                            transformer,
+                            quant_gemm_type=args.quant_gemm_type,
+                            nvfp4_gemm_backend=args.nvfp4_gemm_backend,
+                            nvfp4_scale_rule=args.nvfp4_scale_rule,
+                        )
                         logger.info(f"Rank {global_rank}: Quantization completed, moving to GPU...")
                         transformer = transformer.to(f"cuda:{local_rank}")
                         torch.cuda.empty_cache()
@@ -493,26 +514,30 @@ def main(args):
                     
                     dist.barrier()
             else:
-                transformer = replace_linear_layer(transformer, quant_gemm_type=args.quant_gemm_type)
+                transformer = replace_linear_layer(
+                    transformer,
+                    quant_gemm_type=args.quant_gemm_type,
+                    nvfp4_gemm_backend=args.nvfp4_gemm_backend,
+                    nvfp4_scale_rule=args.nvfp4_scale_rule,
+                )
 
     parallelize_transformer(transformer, sp_size, sp_rank, args.attn_type)
 
     # Stagger the movement of loaded models to GPU to free CPU memory, then create pipeline
     if dist.is_initialized() and get_system_memory_info("available") < 500:
-        # If there is no quantization, or bf16, move VAE and image_encoder to GPU
+        # If there is no quantization, or bf16, move VAE to GPU
         if args.quant_gemm_type is None or args.quant_gemm_type == "bf16":
             for i in range(dist.get_world_size()):
                 if i == global_rank:
-                    logger.info(f"Rank {global_rank}: Moving VAE and image_encoder to GPU...")
+                    logger.info(f"Rank {global_rank}: Moving VAE to GPU...")
                     vae = vae.to(f"cuda:{local_rank}")
-                    image_encoder = image_encoder.to(f"cuda:{local_rank}")
                     torch.cuda.synchronize()
                     torch.cuda.empty_cache()
-                    logger.info(f"Rank {global_rank}: VAE and image_encoder moved to GPU")
-                    print_memory_usage(f"After moving VAE/encoder to GPU (Rank {global_rank})", global_rank)
+                    logger.info(f"Rank {global_rank}: VAE moved to GPU")
+                    print_memory_usage(f"After moving VAE to GPU (Rank {global_rank})", global_rank)
                 dist.barrier()
         else:
-            logger.info(f"Rank {global_rank}: VAE and image_encoder already on GPU (moved before quantization)")
+            logger.info(f"Rank {global_rank}: VAE already on GPU (moved before quantization)")
         
         # All ranks process transformer simultaneously (FSDP needs synchronization)
         logger.info(f"Rank {global_rank}: Moving transformer to GPU and applying FSDP...")
@@ -537,7 +562,6 @@ def main(args):
                 pipe = WanPipeline.from_pretrained(
                     pretrained_model_name_or_path=model_id,
                     vae=vae,  # Already on GPU
-                    image_encoder=image_encoder,  # Already on GPU
                     torch_dtype=torch.bfloat16,
                 )
                 pipe.transformer = transformer  # Already on GPU
@@ -550,7 +574,6 @@ def main(args):
         pipe = WanPipeline.from_pretrained(
             pretrained_model_name_or_path=model_id,
             vae=vae.to(f"cuda:{local_rank}"),
-            image_encoder=image_encoder.to(f"cuda:{local_rank}"),
             torch_dtype=torch.bfloat16,
         )
         pipe.transformer = None
@@ -576,7 +599,7 @@ def main(args):
     # width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
     # image = image.resize((width, height))
 
-    prompt = (
+    default_prompt = (
         "Summer beach vacation style, a white cat wearing sunglasses \
         sits on a surfboard. The fluffy-furred feline gazes directly at the camera \
         with a relaxed expression. Blurred beach scenery forms the background featuring \
@@ -586,6 +609,7 @@ def main(args):
         soft texture of its fur. The cat's expression conveys a sense of relaxation and \
         contentment, as it enjoys the warm sun and the gentle sea breeze."
     )
+    prompt = args.prompt or default_prompt
     negative_prompt = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
 
     torch.cuda.reset_peak_memory_stats()
@@ -601,8 +625,8 @@ def main(args):
             # image=image,
             prompt=prompt,
             negative_prompt=negative_prompt,
-            height=832,
-            width=480,
+            height=args.height,
+            width=args.width,
             num_frames=args.num_frames,
             guidance_scale=5.0,
             num_inference_steps=args.num_inference_steps,
@@ -619,8 +643,14 @@ def main(args):
         output_filename = f"xDiT.wan.output.sp{sp_size}.{args.attn_type}"
         if args.quant_gemm_type is not None:
             output_filename += f".{args.quant_gemm_type}"
-        export_to_video(output, f"{output_filename}.mp4", fps=args.fps)
-        print(f"epoch time: {elapsed_time:.2f} sec; export video to {output_filename}.mp4")
+        if args.quant_gemm_type == "nvfp4":
+            output_filename += f".{args.nvfp4_scale_rule}.{args.nvfp4_gemm_backend}"
+        output_path = args.output_path or f"{output_filename}.mp4"
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        export_to_video(output, output_path, fps=args.fps)
+        print(f"epoch time: {elapsed_time:.2f} sec; export video to {output_path}")
     torch.cuda.empty_cache()
 
     dist.destroy_process_group()
@@ -629,15 +659,33 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_id", type=str, default="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers")
+    parser.add_argument("--model_id", type=str, default="Wan-AI/Wan2.1-T2V-14B-Diffusers")
     parser.add_argument("--ulysses_degree", type=int, default=1)
     parser.add_argument("--ring_degree", type=int, default=1)
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--num_frames", type=int, default=81)
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--height", type=int, default=832)
+    parser.add_argument("--width", type=int, default=480)
+    parser.add_argument("--prompt", type=str, default=None)
     parser.add_argument("--quant_gemm_type", 
                         type=str, default=None, 
-                        help="Available choices: [bf16 (default, no quantization), nvfp4, svdquant.nvfp4, trtllm-fp8-blockwise, nvfp4+trtllm-fp8-blockwise]")
+                        help="Available choices: [bf16 (default, no quantization), nvfp4, trtllm-fp8-blockwise, nvfp4+trtllm-fp8-blockwise]")
+    parser.add_argument(
+        "--nvfp4_gemm_backend",
+        type=str,
+        default="cublaslt",
+        choices=["auto", "cutlass", "cublaslt"],
+        help="GEMM backend for quant_gemm_type=nvfp4.",
+    )
+    parser.add_argument(
+        "--nvfp4_scale_rule",
+        type=str,
+        default="static_6",
+        choices=["static_6", "mse", "mae", "abs_max"],
+        help="'static_6' is standard NVFP4; mse/mae/abs_max enable adaptive 4/6.",
+    )
+    parser.add_argument("--output_path", type=str, default=None)
     parser.add_argument("--attn_type", type=str, default="fa", help="Available choices: [torch, fa, fa3, flashinfer, sage_fp16, sage_fp8, sage_fp8_sm90, sage_fp16_triton, sage_auto, sparse_sage]")
     parser.add_argument("--skip_saving_output", action="store_true")
     args = parser.parse_args()

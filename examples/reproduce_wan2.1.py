@@ -461,7 +461,7 @@ def main(args):
     # Stagger the quantization conversion (if needed)
     # Strategy: when one rank quantizes, other ranks move the transformer to GPU to free CPU memory
     if args.quant_gemm_type is not None:
-        assert args.quant_gemm_type in ["bf16", "nvfp4", "svdquant.nvfp4", "trtllm-fp8-blockwise", "nvfp4+trtllm-fp8-blockwise"], "Invalid quant_gemm_type"
+        assert args.quant_gemm_type in ["bf16", "nvfp4", "trtllm-fp8-blockwise", "nvfp4+trtllm-fp8-blockwise"], "Invalid quant_gemm_type"
         if args.quant_gemm_type != "bf16":
             if dist.is_initialized() and get_system_memory_info("available") < 500:
                 transformer_on_gpu = False
@@ -636,7 +636,7 @@ if __name__ == "__main__":
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--quant_gemm_type", 
                         type=str, default=None, 
-                        help="Available choices: [bf16 (default, no quantization), nvfp4, svdquant.nvfp4, trtllm-fp8-blockwise, nvfp4+trtllm-fp8-blockwise]")
+                        help="Available choices: [bf16 (default, no quantization), nvfp4, trtllm-fp8-blockwise, nvfp4+trtllm-fp8-blockwise]")
     parser.add_argument("--attn_type", type=str, default="fa", help="Available choices: [torch, fa, fa3, flashinfer, sage_fp16, sage_fp8, sage_fp8_sm90, sage_fp16_triton, sage_auto, sparse_sage]")
     parser.add_argument("--skip_saving_output", action="store_true")
     args = parser.parse_args()

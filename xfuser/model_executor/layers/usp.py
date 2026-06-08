@@ -4,7 +4,10 @@ import functools
 
 import torch.distributed._functional_collectives as ft_c
 
-from torch.distributed.tensor.experimental._attention import _templated_ring_attention
+try:
+    from torch.distributed.tensor.experimental._attention import _templated_ring_attention
+except ImportError:
+    _templated_ring_attention = None
 import xfuser.envs as envs
 
 if torch.cuda.is_available() or envs._is_npu():
@@ -44,6 +47,12 @@ _HEAD_BALANCE_BACKENDS = frozenset({
 
 
 def ring_attn(attention_function, query, key, value, dropout_p=0.0, is_causal=False, joint_attn_kwargs=None, attention_kwargs=None):
+    if _templated_ring_attention is None:
+        raise RuntimeError(
+            "torch.distributed.tensor.experimental._attention._templated_ring_attention "
+            "is not available in this PyTorch build. Ring parallel attention requires "
+            "a PyTorch version that still exposes this private API."
+        )
     kwargs = {
         "dropout_p": dropout_p,
         "is_causal": is_causal,
@@ -51,8 +60,12 @@ def ring_attn(attention_function, query, key, value, dropout_p=0.0, is_causal=Fa
         "attention_kwargs": attention_kwargs,
     }
     if parse(torch.__version__).release >= parse("2.6.0").release:
-        from torch.distributed.tensor.experimental._attention import _cp_options
-        _cp_options.enable_load_balance = False
+        try:
+            from torch.distributed.tensor.experimental._attention import _cp_options
+
+            _cp_options.enable_load_balance = False
+        except ImportError:
+            pass
         out, *_ = _templated_ring_attention(
             PROCESS_GROUP.RING_PG,
             1,
@@ -390,4 +403,3 @@ def attention(
         attention_kwargs=attention_kwargs,
     )
     return out
-
