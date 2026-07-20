@@ -1,0 +1,26 @@
+# Add the validated FA4 CUDA 13 stack to an existing digest-pinned runtime.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG FLASH_ATTN_4_VERSION=4.0.0b22
+ARG CUTLASS_DSL_VERSION=4.6.0.dev0
+
+# Old monolithic and partially upgraded CUTLASS distributions can share the
+# same Python `cutlass` files. Remove every known layout before pip installs the
+# exact FA4 dependency graph. The inherited FA2 package is intentionally kept.
+RUN python3 -m pip uninstall --yes \
+        cutlass \
+        nvidia-cutlass \
+        nvidia-cutlass-dsl \
+        nvidia-cutlass-dsl-libs-base \
+        nvidia-cutlass-dsl-libs-cu13 \
+    && python3 -m pip install --no-cache-dir \
+        "flash-attn-4[cu13]==${FLASH_ATTN_4_VERSION}"
+
+COPY docker/verify_fa4_runtime.py /usr/local/bin/verify-xdit-fa4-runtime
+
+# Docker builds normally have no GPU. This still verifies the exact package
+# versions and that FA2, FA4, and the replacement CUTLASS namespace coexist.
+RUN FLASH_ATTN_4_VERSION="${FLASH_ATTN_4_VERSION}" \
+    CUTLASS_DSL_VERSION="${CUTLASS_DSL_VERSION}" \
+    python3 /usr/local/bin/verify-xdit-fa4-runtime --skip-device-check

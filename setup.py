@@ -44,6 +44,12 @@ if __name__ == "__main__":
             "flash-attn": [
                 "flash-attn>=2.6.0",  # NOTE: flash-attn is necessary if ring_degree > 1
             ],
+            "flash-attn-4": [
+                "flash-attn-4==4.0.0b22",
+            ],
+            "flash-attn-4-cu13": [
+                "flash-attn-4[cu13]==4.0.0b22",
+            ],
             "optimum-quanto": [
                 "optimum-quanto",  # NOTE: optimum-quanto is necessary if use_fp8_t5_encoder is enabled
             ],

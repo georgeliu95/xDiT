@@ -173,19 +173,25 @@ About `diffusers` version:
 - While we specify a diffusers version in `setup.py`, newer models may require later versions or even need to be installed from main branch.
 - Limited list of validated diffusers versions can be seen [here](#7-limitations).
 
-`flash_attn` is an optional library that can be installed with xDiT. More supported attention backends can be seen [here](#6-supported-attention-backends).
+FlashAttention is optional. The `flash-attn` extra installs FA2 for ring
+attention. FA4 is a separate package with CUDA-major-specific extras. More
+supported attention backends can be seen [here](#6-supported-attention-backends).
 
 ```
 pip install xfuser  # Basic installation
-pip install "xfuser[flash-attn]"  # With flash attention
+pip install "xfuser[flash-attn]"  # FA2
+pip install "xfuser[flash-attn-4]"  # FA4 on CUDA 12.x
+pip install "xfuser[flash-attn-4-cu13]"  # FA4 on CUDA 13.x
 ```
 
 ### 2. Install from source
 
 ```
 pip install -e .
-# Or optionally, with flash attention
+# Or optionally, with a FlashAttention backend
 pip install -e ".[flash-attn]"
+pip install -e ".[flash-attn-4]"  # CUDA 12.x
+pip install -e ".[flash-attn-4-cu13]"  # CUDA 13.x
 ```
 
 Note that we use two self-maintained packages:
@@ -195,9 +201,33 @@ Note that we use two self-maintained packages:
 
 The [flash_attn](https://github.com/Dao-AILab/flash-attention) used for yunchang should be >= 2.6.0
 
+The FA4 extras pin the official `flash-attn-4==4.0.0b22` beta. The package
+must be installed in the runtime image; installing or mounting xDiT source
+alone does not add the CUDA kernels.
+
 ### 3. Docker
 
 We provide a docker image for developers to develop with xDiT. The docker image is [thufeifeibear/xdit-dev](https://hub.docker.com/r/thufeifeibear/xdit-dev). For running with AMD GPUs (MI300X or newer), a monthly image with validated support for select models is available as well: [rocm/pytorch-xdit](https://hub.docker.com/r/rocm/pytorch-xdit)
+
+The default developer Dockerfile keeps the FA2 installation path. For an
+SM120 system with a CUDA 13 base image that already contains FA2, build the
+separate FA4 overlay from an immutable base reference:
+
+```bash
+docker build --pull=false \
+  --file docker/Dockerfile.fa4-cu13 \
+  --build-arg BASE_IMAGE='<base-image>@sha256:<digest>' \
+  --tag xdit-fa4-cu13 .
+
+docker run --rm --gpus all --network none xdit-fa4-cu13 \
+  python3 /usr/local/bin/verify-xdit-fa4-runtime
+```
+
+The overlay preserves FA2, removes legacy or partially upgraded CUTLASS DSL
+packages, and then installs `flash-attn-4[cu13]==4.0.0b22`. The runtime probe
+checks both attention imports, exact FA4/CUTLASS versions, and SM120 before a
+workload starts. This clean replacement order matters: upgrading a monolithic
+CUTLASS DSL installation in place can remove shared `cutlass` module files.
 
 ### 4. Usage
 
@@ -284,6 +314,13 @@ Several different attention backends are supported:
 xDiT comes with `flash_attn` as an optional install requirement, as it currently supports the largest variety of different GPU architectures.
 However, newer implementations generally offer better performance. If available for you, we highly recommend using `cuDNN`, `FAv3`, `FAv3 FP8` (on _hopper_ GPUs) or `FAv4`, `Transformer engine FP8` (on _blackwell_ GPUs).
 On recent AMD GPUs (MI300X or newer) it is generally recommended to use `AITER` in all cases to get the best possible performance. Note that when using `AITER FP8` as the attention backend with `torch.compile`, it is important to use a version of `AITER` from Jan 16, 2026 or later. Older versions may trigger a bug related to the fake tensors, resulting in a runtime error.
+
+The unified Wan runner selects FA4 with `--attention_backend flash_4`. The
+legacy Wan2.1/Wan2.2 T2V reproduction scripts accept `--attn_type fa4` for the
+SM120, BF16, single-process (`WORLD_SIZE=1`, `ulysses_degree=1`,
+`ring_degree=1`) path. That legacy path routes both self-attention and
+cross-attention through FA4 and fails closed when the package, GPU capability,
+or parallelism is incompatible.
 
 `aiter_flydsl` uses a FlyDSL kernel (MLIR-compiled), validated on gfx1200+ (RDNA4). It only supports causal self-attention; non-causal and cross-attention calls automatically fall back to `sdpa_flash`.
 
