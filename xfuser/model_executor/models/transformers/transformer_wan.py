@@ -17,6 +17,7 @@ from xfuser.core.distributed import (
     get_sp_group,
     get_runtime_state,
 )
+from xfuser.core.distributed.attention_backend import AttentionBackendType
 from xfuser.model_executor.layers.attention_processor import (
     xFuserAttentionProcessorRegister
 )
@@ -81,11 +82,12 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         attention_mask: Optional[torch.Tensor] = None,
         rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
+        runtime_state = get_runtime_state()
         backend = None
         if self.is_cross_attention:
             # We allow specifying a different backend for cross-attention than the main attention backend
             # as some backends may have too much overhead for cross-attention.
-            backend = get_runtime_state().get_cross_attention_backend()
+            backend = runtime_state.get_cross_attention_backend()
 
         encoder_hidden_states_img = None
         if attn.add_k_proj is not None:
@@ -103,7 +105,21 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         key = key.unflatten(2, (attn.heads, -1))
         value = value.unflatten(2, (attn.heads, -1))
 
-        if rotary_emb is not None:
+        if (
+            rotary_emb is not None
+            and not self.is_cross_attention
+            and runtime_state.attention_backend
+            == AttentionBackendType.FLASHINFER_NVFP4
+            and query.shape[0] == 1
+        ):
+            from tllm_linear_lite.wan_qk_rope import apply_wan_qk_rotary_embedding
+
+            query, key = apply_wan_qk_rotary_embedding(
+                query,
+                key,
+                *rotary_emb,
+            )
+        elif rotary_emb is not None:
 
             def apply_rotary_emb(
                 hidden_states: torch.Tensor,
@@ -256,7 +272,8 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
             lora_scale = 1.0
 
 
-        get_runtime_state().increment_step_counter()
+        runtime_state = get_runtime_state()
+        runtime_state.increment_step_counter()
 
         sp_world_rank = get_sequence_parallel_rank()
         sp_world_size = get_sequence_parallel_world_size()
