@@ -50,6 +50,9 @@ if __name__ == "__main__":
             "flash-attn-4-cu13": [
                 "flash-attn-4[cu13]==4.0.0b22",
             ],
+            "flashinfer-nvfp4": [
+                "flashinfer-python==0.6.15.dev20260722",
+            ],
             "optimum-quanto": [
                 "optimum-quanto",  # NOTE: optimum-quanto is necessary if use_fp8_t5_encoder is enabled
             ],

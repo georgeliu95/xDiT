@@ -27,7 +27,8 @@ class _FakeRuntime:
 
 
 class _FakeProcessor:
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, *args, **kwargs) -> None:
+        self.args = args
         self.kwargs = kwargs
 
 
@@ -37,7 +38,14 @@ def _empty_module(name: str) -> ModuleType:
     return module
 
 
-def _load_module(*, package_available: bool, cuda_available: bool, capability):
+def _load_module(
+    *,
+    package_available: bool,
+    cuda_available: bool,
+    capability,
+    flashinfer_nvfp4_available: bool = False,
+    sage_available: bool = False,
+):
     runtime = _FakeRuntime()
     state = {"initialized": False}
 
@@ -79,11 +87,20 @@ def _load_module(*, package_available: bool, cuda_available: bool, capability):
     distributed.get_runtime_state = lambda: runtime
 
     backend_module = ModuleType("xfuser.core.distributed.attention_backend")
-    backend_module.AttentionBackendType = SimpleNamespace(FLASH_4="flash_4")
+    backend_module.AttentionBackendType = SimpleNamespace(
+        FLASH_4="flash_4",
+        FLASHINFER_NVFP4="flashinfer_nvfp4",
+        SAGE="sage",
+        SDPA_FLASH="sdpa_flash",
+    )
 
     envs = ModuleType("xfuser.envs")
     envs.PACKAGES_CHECKER = SimpleNamespace(
-        get_packages_info=lambda: {"has_flash_attn_4": package_available}
+        get_packages_info=lambda: {
+            "has_flash_attn_4": package_available,
+            "has_flashinfer_nvfp4": flashinfer_nvfp4_available,
+            "has_sage": sage_available,
+        }
     )
 
     xfuser_wan = ModuleType("xfuser.model_executor.models.transformers.transformer_wan")

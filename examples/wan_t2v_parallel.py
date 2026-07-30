@@ -1,4 +1,5 @@
 """Wan T2V sequence sharding and legacy forward instrumentation."""
+# noqa: SIZE_OK - keep backend routes with the legacy forward per project convention
 
 from __future__ import annotations
 
@@ -32,6 +33,8 @@ from wan_legacy_attention import xDiTWanAttnProcessor
 
 logger = init_logger(__name__)
 FA4_ATTENTION_TYPE: Final = "fa4"
+FLASHINFER_NVFP4_ATTENTION_TYPE: Final = "flashinfer_nvfp4"
+SAGE_FP8_ATTENTION_TYPE: Final = "sage_fp8"
 
 
 class WanFa4ParallelismError(RuntimeError):
@@ -42,34 +45,78 @@ class WanFa4RuntimeError(RuntimeError):
     """Raised when the legacy FA4 route is not runnable on this host."""
 
 
+class WanFlashInferNvfp4ParallelismError(RuntimeError):
+    """Raised when the legacy FlashInfer NVFP4 route uses parallel attention."""
+
+
+class WanFlashInferNvfp4RuntimeError(RuntimeError):
+    """Raised when the legacy FlashInfer NVFP4 route is not runnable."""
+
+
+class WanSageFp8ParallelismError(RuntimeError):
+    """Raised when the Sage FP8 plus FA4 route uses parallel attention."""
+
+
+class WanSageFp8RuntimeError(RuntimeError):
+    """Raised when the Sage FP8 plus FA4 route is not runnable."""
+
+
 def validate_wan_fa4_request(
     attention_type: str,
     ulysses_degree: int,
     ring_degree: int,
 ) -> None:
-    """Fail before model loading when a requested legacy FA4 route cannot run."""
-    if attention_type != FA4_ATTENTION_TYPE:
+    """Fail before model loading when an explicit single-device route cannot run."""
+    supported_single_device_routes = (
+        FA4_ATTENTION_TYPE,
+        FLASHINFER_NVFP4_ATTENTION_TYPE,
+        SAGE_FP8_ATTENTION_TYPE,
+    )
+    if attention_type not in supported_single_device_routes:
         return
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if ulysses_degree != 1 or ring_degree != 1 or world_size != 1:
-        raise WanFa4ParallelismError(
-            "The legacy Wan FA4 route requires ulysses_degree=1 and "
+        error_type = {
+            FA4_ATTENTION_TYPE: WanFa4ParallelismError,
+            FLASHINFER_NVFP4_ATTENTION_TYPE: WanFlashInferNvfp4ParallelismError,
+            SAGE_FP8_ATTENTION_TYPE: WanSageFp8ParallelismError,
+        }[attention_type]
+        raise error_type(
+            f"The legacy Wan {attention_type} route requires ulysses_degree=1 and "
             "ring_degree=1 in a single-process launch; received "
             f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, "
             f"and WORLD_SIZE={world_size}."
         )
 
-    package_available = PACKAGES_CHECKER.get_packages_info()["has_flash_attn_4"]
+    required_package_keys = {
+        FA4_ATTENTION_TYPE: ("has_flash_attn_4",),
+        FLASHINFER_NVFP4_ATTENTION_TYPE: (
+            "has_flashinfer_nvfp4",
+            "has_flash_attn_4",
+        ),
+        SAGE_FP8_ATTENTION_TYPE: ("has_sage", "has_flash_attn_4"),
+    }[attention_type]
+    packages_info = PACKAGES_CHECKER.get_packages_info()
+    missing_packages = tuple(
+        package_key
+        for package_key in required_package_keys
+        if not packages_info.get(package_key, False)
+    )
     device_capability = (
         torch.cuda.get_device_capability() if torch.cuda.is_available() else None
     )
-    if device_capability != (12, 0) or not package_available:
-        raise WanFa4RuntimeError(
-            "The legacy Wan FA4 route requires an SM120 CUDA device and the "
-            "matching flash-attn-4 package; received "
+    if device_capability != (12, 0) or missing_packages:
+        error_type = {
+            FA4_ATTENTION_TYPE: WanFa4RuntimeError,
+            FLASHINFER_NVFP4_ATTENTION_TYPE: WanFlashInferNvfp4RuntimeError,
+            SAGE_FP8_ATTENTION_TYPE: WanSageFp8RuntimeError,
+        }[attention_type]
+        raise error_type(
+            f"The legacy Wan {attention_type} route requires an SM120 CUDA "
+            f"device and packages {required_package_keys}; received "
             f"device_capability={device_capability} and "
-            f"package_available={package_available}."
+            f"missing_packages={missing_packages}."
         )
 
 
@@ -89,6 +136,57 @@ def configure_wan_fa4_single_device(
     for block in transformer.blocks:
         block.attn1.processor = xFuserWanAttnProcessor(
             use_ulysses_parallel_attention=False,
+        )
+        block.attn2.processor = xFuserWanAttnProcessor(
+            use_ulysses_parallel_attention=False,
+            is_cross_attention=True,
+        )
+
+
+def configure_wan_flashinfer_nvfp4_single_device(
+    transformer: WanTransformer3DModel,
+    sequence_parallel_size: int,
+) -> None:
+    """Use NVFP4 for Wan self-attention and BF16 FA4 for cross-attention."""
+    validate_wan_fa4_request(
+        FLASHINFER_NVFP4_ATTENTION_TYPE,
+        sequence_parallel_size,
+        1,
+    )
+
+    if not runtime_state_is_initialized():
+        initialize_runtime_state()
+    runtime_state = get_runtime_state()
+    runtime_state.set_attention_backend(AttentionBackendType.FLASHINFER_NVFP4)
+    runtime_state.set_cross_attention_backend(AttentionBackendType.FLASH_4)
+
+    for block in transformer.blocks:
+        block.attn1.processor = xFuserWanAttnProcessor(
+            use_ulysses_parallel_attention=False,
+        )
+        block.attn2.processor = xFuserWanAttnProcessor(
+            use_ulysses_parallel_attention=False,
+            is_cross_attention=True,
+        )
+
+
+def configure_wan_sage_fp8_fa4_single_device(
+    transformer: WanTransformer3DModel,
+    sequence_parallel_size: int,
+) -> None:
+    """Use explicit Sage FP8 self-attention and BF16 FA4 cross-attention."""
+    validate_wan_fa4_request(SAGE_FP8_ATTENTION_TYPE, sequence_parallel_size, 1)
+
+    if not runtime_state_is_initialized():
+        initialize_runtime_state()
+    runtime_state = get_runtime_state()
+    runtime_state.set_attention_backend(AttentionBackendType.SAGE)
+    runtime_state.set_cross_attention_backend(AttentionBackendType.FLASH_4)
+
+    for block in transformer.blocks:
+        block.attn1.processor = xDiTWanAttnProcessor(
+            SAGE_FP8_ATTENTION_TYPE,
+            single_device=True,
         )
         block.attn2.processor = xFuserWanAttnProcessor(
             use_ulysses_parallel_attention=False,
@@ -139,8 +237,14 @@ def parallelize_transformer(
 ) -> None:
     """Install the profiled Wan forward and selected attention processors."""
     uses_fa4 = attn_type == FA4_ATTENTION_TYPE
+    uses_flashinfer_nvfp4 = attn_type == FLASHINFER_NVFP4_ATTENTION_TYPE
+    uses_sage_fp8 = attn_type == SAGE_FP8_ATTENTION_TYPE
     if uses_fa4:
         configure_wan_fa4_single_device(transformer, sp_size)
+    elif uses_flashinfer_nvfp4:
+        configure_wan_flashinfer_nvfp4_single_device(transformer, sp_size)
+    elif uses_sage_fp8:
+        configure_wan_sage_fp8_fa4_single_device(transformer, sp_size)
 
     @functools.wraps(transformer.__class__.forward)
     def new_forward(
@@ -216,7 +320,7 @@ def parallelize_transformer(
             seq_dim_idx=seq_dim_idx,
         )
 
-        if not uses_fa4:
+        if not (uses_fa4 or uses_flashinfer_nvfp4 or uses_sage_fp8):
             if sp_size > 1:
                 for block in transformer.blocks:
                     block.attn1.processor = xDiTWanAttnProcessor(attn_type)

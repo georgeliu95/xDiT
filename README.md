@@ -174,14 +174,17 @@ About `diffusers` version:
 - Limited list of validated diffusers versions can be seen [here](#7-limitations).
 
 FlashAttention is optional. The `flash-attn` extra installs FA2 for ring
-attention. FA4 is a separate package with CUDA-major-specific extras. More
-supported attention backends can be seen [here](#6-supported-attention-backends).
+attention. FA4 is a separate package with CUDA-major-specific extras, and the
+FlashInfer extra installs its SM120/SM121 NVFP4 attention path. More supported
+attention backends can be seen [here](#6-supported-attention-backends).
 
 ```
 pip install xfuser  # Basic installation
 pip install "xfuser[flash-attn]"  # FA2
 pip install "xfuser[flash-attn-4]"  # FA4 on CUDA 12.x
 pip install "xfuser[flash-attn-4-cu13]"  # FA4 on CUDA 13.x
+pip install --pre --extra-index-url https://flashinfer.ai/whl/nightly/ \
+    "xfuser[flashinfer-nvfp4]"  # FlashInfer NVFP4 on SM120/SM121
 ```
 
 ### 2. Install from source
@@ -192,6 +195,8 @@ pip install -e .
 pip install -e ".[flash-attn]"
 pip install -e ".[flash-attn-4]"  # CUDA 12.x
 pip install -e ".[flash-attn-4-cu13]"  # CUDA 13.x
+pip install --pre --extra-index-url https://flashinfer.ai/whl/nightly/ \
+    -e ".[flashinfer-nvfp4]"  # SM120/SM121
 ```
 
 Note that we use two self-maintained packages:
@@ -301,6 +306,7 @@ Several different attention backends are supported:
 | [Transformer Engine FP8](https://github.com/NVIDIA/TransformerEngine) | nvte_fp8 |
 | [FAv4](https://github.com/Dao-AILab/flash-attention/tree/main/flash_attn/cute) | flash_4 |
 | [FAv4 FP4](https://github.com/hao-ai-lab/flash-attention-fp4) | flash_4_fp4 |
+| [FlashInfer SM120/SM121 NVFP4](https://github.com/flashinfer-ai/flashinfer/pull/3897) | flashinfer_nvfp4 |
 | [SAGE](https://github.com/thu-ml/SageAttention) | sage |
 | [AITER](https://github.com/rocm/aiter) | aiter |
 | [AITER FP8](https://github.com/rocm/aiter) | aiter_fp8 |
@@ -321,6 +327,31 @@ SM120, BF16, single-process (`WORLD_SIZE=1`, `ulysses_degree=1`,
 `ring_degree=1`) path. That legacy path routes both self-attention and
 cross-attention through FA4 and fails closed when the package, GPU capability,
 or parallelism is incompatible.
+
+FlashInfer NVFP4 is an explicit low-precision backend; xDiT does not select it
+automatically. It requires the pinned `flashinfer-python` nightly containing
+[the SM120 correctness fixes](https://github.com/flashinfer-ai/flashinfer/pull/3838),
+[native SM121 support](https://github.com/flashinfer-ai/flashinfer/pull/3897),
+an SM120 or SM121 GPU, FP16/BF16 QKV input, head dimension 64 or 128, and equal
+Q/K/V shapes. SM120 requires CUDA 12.8 or newer; SM121 requires CUDA 12.9 or
+newer. Stable 0.6.14, 0.6.15, and the diverged 0.6.15.post1 release are
+rejected because they do not contain both fixes. The unified runner should
+pair `--attention_backend flashinfer_nvfp4` with a BF16 cross-attention backend
+on either SM120 or SM121. The legacy Wan2.1/Wan2.2 scripts expose
+`--attn_type flashinfer_nvfp4`, but that route is SM120-only because it pairs
+NVFP4 self-attention with the legacy BF16 FA4 cross-attention path, which is
+validated only on SM120. The legacy route also supports only a single-process
+run. Their existing `--attn_type sage_fp8` route likewise uses explicit Sage
+FP8 for self-attention and BF16 FA4 for cross-attention on the SM120
+single-process path. The upstream kernel internally zero-pads sequence lengths
+to a multiple of 128;
+xDiT trims the returned output and LSE to the original length. For non-causal
+attention whose sequence length is not 128-aligned, those padded keys remain
+part of the kernel's approximation. xDiT defaults to global centering with
+`flashinfer_nvfp4_per_block_mean=False`, whose correction shape is
+`[B, H, 1, S]`. Advanced callers can opt into block centering through
+`attention_kwargs`; that uses `[B, H, S/128, S]` and trades additional memory
+for block-local accuracy.
 
 `aiter_flydsl` uses a FlyDSL kernel (MLIR-compiled), validated on gfx1200+ (RDNA4). It only supports causal self-attention; non-causal and cross-attention calls automatically fall back to `sdpa_flash`.
 

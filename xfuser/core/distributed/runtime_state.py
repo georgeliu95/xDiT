@@ -28,6 +28,7 @@ if envs._is_npu():
 
 from xfuser.core.distributed.attention_backend import AttentionBackendType
 from xfuser.core.distributed.attention_schedule import AttentionSchedule, GemmPrecisionSchedule
+from xfuser.core.distributed.flashinfer_nvfp4 import FlashInferNvfp4UnavailableError
 from xfuser.config.config import (
     ParallelConfig,
     RuntimeConfig,
@@ -127,7 +128,7 @@ class RuntimeState(metaclass=ABCMeta):
         self._check_if_backend_compatible_with_current_configuration(attention_backend)
         self.attention_backend = attention_backend
         logger.warning("Using {} as attention backend.".format(self.attention_backend.name))
-        if attention_backend in [AttentionBackendType.FLASH_3_FP8, AttentionBackendType.AITER_FP8, AttentionBackendType.NVTE_FP8, AttentionBackendType.FLASH_4_FP4, AttentionBackendType.AITER_MLA]:
+        if attention_backend in [AttentionBackendType.FLASH_3_FP8, AttentionBackendType.AITER_FP8, AttentionBackendType.NVTE_FP8, AttentionBackendType.FLASH_4_FP4, AttentionBackendType.FLASHINFER_NVFP4, AttentionBackendType.AITER_MLA]:
             logger.warning("Low-precision attention backend is enabled. This may cause poor quality outputs, consider using hybrid attention if possible.")
 
 
@@ -136,6 +137,11 @@ class RuntimeState(metaclass=ABCMeta):
         Set the cross-attention backend. When None, cross-attention will use the main attention_backend.
         """
         if cross_attention_backend is None:
+            if self.attention_backend == AttentionBackendType.FLASHINFER_NVFP4:
+                raise ValueError(
+                    "FlashInfer NVFP4 supports only same-shape self-attention; "
+                    "set an explicit non-NVFP4 cross-attention backend."
+                )
             self.cross_attention_backend = None
             return
 
@@ -147,6 +153,12 @@ class RuntimeState(metaclass=ABCMeta):
 
         if not isinstance(cross_attention_backend, AttentionBackendType):
             raise ValueError(f"Value '{cross_attention_backend}' is not a valid attention backend.")
+
+        if cross_attention_backend == AttentionBackendType.FLASHINFER_NVFP4:
+            raise ValueError(
+                "FlashInfer NVFP4 cannot be used for cross-attention because "
+                "it requires query, key, and value tensors with identical shapes."
+            )
 
         self._check_if_backend_compatible_with_current_configuration(cross_attention_backend)
         self.cross_attention_backend = cross_attention_backend
@@ -210,6 +222,7 @@ class RuntimeState(metaclass=ABCMeta):
                                  AttentionBackendType.SDPA_MATH,
                                  AttentionBackendType.FLASH_4,
                                  AttentionBackendType.FLASH_4_FP4,
+                                 AttentionBackendType.FLASHINFER_NVFP4,
                                  AttentionBackendType.AITER_FP8,
                                  AttentionBackendType.AITER_MLA,
                                  AttentionBackendType.AITER_SAGE,
@@ -256,6 +269,15 @@ class RuntimeState(metaclass=ABCMeta):
                         f"{attention_backend.value} attention is missing {missing} "
                         "required for ring parallelism, please update AITER"
                     )
+        if (
+            attention_backend == AttentionBackendType.FLASHINFER_NVFP4
+            and not env_info.get("has_flashinfer_nvfp4")
+        ):
+            raise FlashInferNvfp4UnavailableError(
+                "requires an SM120 or SM121 CUDA device and a FlashInfer build "
+                "with the NVFP4 fixes from PRs #3838 and #3897"
+            )
+
         if attention_backend == AttentionBackendType.AITER_FP8:
             try:
                 from aiter import flash_attn_fp8_pertensor_func
@@ -1033,4 +1055,3 @@ def initialize_runtime_state(pipeline: Optional[DiffusionPipeline] = None, engin
         _RUNTIME = UnetRuntimeState(pipeline=pipeline, config=engine_config)
     elif not pipeline:
         _RUNTIME = ExternalRuntimeState()
-

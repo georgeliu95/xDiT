@@ -412,6 +412,8 @@ if env_info["has_flash_attn_4"]:
 if env_info["has_flash_attn_4_fp4"]:
     from flash_attn.cute.interface import flash_attn_func as flash_attn_func_4_fp4
     from xfuser.core.distributed.fp4_quantize import quantize_qk_to_fp4
+if env_info["has_flashinfer_nvfp4"]:
+    from xfuser.core.distributed.flashinfer_nvfp4 import flashinfer_nvfp4_attention
 if env_info["has_transformer_engine"]:
     from transformer_engine.pytorch import DotProductAttention, fp8_autocast
     from transformer_engine.common import recipe
@@ -438,6 +440,7 @@ class AttentionBackendType(Enum):
     NVTE_FP8 = "NVTE FP8"
     FLASH_4 = "Flash Attention V4"
     FLASH_4_FP4 = "Flash Attention V4 FP4"
+    FLASHINFER_NVFP4 = "FlashInfer SM12x NVFP4"
     SAGE = "Sage Attention"
     FLEX_BLOCK_ATTN = "Flex Block Attention"
     AITER = "AITER"
@@ -699,6 +702,31 @@ def _flash_attn_4_fp4_call(query, key, value, dropout_p, is_causal, attention_kw
     )
     output = torch.permute(output, [0, 2, 1, 3])
     return output, softmax_lse
+
+
+@register_attention_function(AttentionBackendType.FLASHINFER_NVFP4)
+@torch.compiler.disable
+def _flashinfer_nvfp4_attn_call(
+    query,
+    key,
+    value,
+    dropout_p,
+    is_causal,
+    attention_kwargs=None,
+):
+    """Run FlashInfer's dense SM12x NVFP4 quantization and attention kernels."""
+    per_block_mean = (attention_kwargs or {}).get(
+        "flashinfer_nvfp4_per_block_mean",
+        False,
+    )
+    return flashinfer_nvfp4_attention(
+        query,
+        key,
+        value,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        per_block_mean=per_block_mean,
+    )
 
 def _fp8_hadamard_rotate(x: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
     """Orthonormal Hadamard rotation along head_dim (in blocks of R.shape[-1]).

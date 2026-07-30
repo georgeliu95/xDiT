@@ -1,6 +1,7 @@
 import os
 import torch
 import diffusers
+from importlib import metadata
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 from packaging import version
 
@@ -49,6 +50,22 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     "AITER_SAGE_V2_BLOCK_R": lambda: os.environ.get("XFUSER_AITER_SAGE_V2_BLOCK_R", "128"),
     "XDIT_FBCACHE_THRESH": lambda: os.environ.get("XDIT_FBCACHE_THRESH", None),
 }
+
+FLASHINFER_NVFP4_FIRST_FIXED_NIGHTLY = version.parse("0.6.15.dev20260717")
+FLASHINFER_NVFP4_FIRST_FIXED_RELEASE = version.parse("0.6.16")
+
+
+def _has_fixed_flashinfer_nvfp4_version(package_version: str) -> bool:
+    installed_version = version.parse(package_version)
+    fixed_nightly = (
+        installed_version.is_devrelease
+        and installed_version >= FLASHINFER_NVFP4_FIRST_FIXED_NIGHTLY
+    )
+    fixed_release = (
+        not installed_version.is_devrelease
+        and installed_version >= FLASHINFER_NVFP4_FIRST_FIXED_RELEASE
+    )
+    return fixed_nightly or fixed_release
 
 
 def _is_hip():
@@ -206,6 +223,7 @@ class PackagesEnvChecker:
         packages_info["has_flash_attn_3"] = self._check_flash_attn_3()
         packages_info["has_flash_attn_4"] = self._check_flash_attn_4()
         packages_info["has_flash_attn_4_fp4"] = self._check_flash_attn_4_fp4()
+        packages_info["has_flashinfer_nvfp4"] = self._check_flashinfer_nvfp4()
         packages_info["has_transformer_engine"] = self.check_transformer_engine()
         packages_info["has_sage"] = self._check_sage()
         packages_info["has_flex_block_attn"] = self._check_flex_block_attn()
@@ -292,6 +310,36 @@ class PackagesEnvChecker:
             os.environ.setdefault("CUTE_DSL_ENABLE_TVM_FFI", "1")
             return True
         except:
+            return False
+
+    def _check_flashinfer_nvfp4(self):
+        if not torch.cuda.is_available() or _is_hip():
+            return False
+        try:
+            capability = torch.cuda.get_device_capability()
+            if capability not in {(12, 0), (12, 1)}:
+                return False
+            minimum_cuda = version.parse(
+                "12.8" if capability == (12, 0) else "12.9"
+            )
+            if version.parse(torch.version.cuda or "0") < minimum_cuda:
+                return False
+            if not _has_fixed_flashinfer_nvfp4_version(
+                metadata.version("flashinfer-python")
+            ):
+                return False
+            from flashinfer import (  # noqa: F401
+                nvfp4_attention_sm120_fwd,
+                nvfp4_attention_sm120_quantize_qkv,
+            )
+            return True
+        except (
+            ImportError,
+            AttributeError,
+            RuntimeError,
+            metadata.PackageNotFoundError,
+            version.InvalidVersion,
+        ):
             return False
 
     @staticmethod

@@ -64,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
             "fa",
             "fa3",
             "fa4",
+            "flashinfer_nvfp4",
             "flashinfer",
             "sage_fp16",
             "sage_fp8",

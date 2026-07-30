@@ -7,9 +7,9 @@ from typing import Optional, Tuple, Union
 import nvtx
 import torch
 from diffusers.models.attention import Attention
-from diffusers.models.transformers.transformer_wan import WanAttnProcessor2_0
+from diffusers.models.transformers.transformer_wan import WanAttnProcessor
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
-from yunchang.kernels import AttnType
+from yunchang.kernels import AttnType, select_flash_attn_impl
 
 
 ATTENTION_IMPLEMENTATIONS = {
@@ -25,13 +25,56 @@ ATTENTION_IMPLEMENTATIONS = {
 }
 
 
-class xDiTWanAttnProcessor(WanAttnProcessor2_0):
+class xDiTWanAttnProcessor(WanAttnProcessor):
     """Wan rotary attention backed by the legacy yunchang implementations."""
 
-    def __init__(self, attn_type: str = "fa"):
+    def __init__(self, attn_type: str = "fa", *, single_device: bool = False):
         super().__init__()
-        self.hybrid_seq_parallel_attn = xFuserLongContextAttention(
-            attn_type=ATTENTION_IMPLEMENTATIONS[attn_type]
+        self.attn_type = ATTENTION_IMPLEMENTATIONS[attn_type]
+        self.single_device_attention = None
+        self.single_device_attention_config = None
+        self.hybrid_seq_parallel_attn = None
+        if single_device and self.attn_type == AttnType.SAGE_FP8:
+            self.single_device_attention = select_flash_attn_impl(
+                self.attn_type,
+                stage="fwd-only",
+            )
+            self.single_device_attention_config = {
+                "tensor_layout": "NHD",
+                "qk_quant_gran": "per_warp",
+                "pv_accum_dtype": "fp32+fp16",
+                "return_lse": False,
+            }
+        else:
+            self.hybrid_seq_parallel_attn = xFuserLongContextAttention(
+                attn_type=self.attn_type
+            )
+
+    def _run_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.single_device_attention is not None:
+            return self.single_device_attention(
+                query,
+                key,
+                value,
+                is_causal=False,
+                qk_quant_gran="per_warp",
+                pv_accum_dtype="fp32+fp16",
+                return_lse=False,
+            )
+
+        assert self.hybrid_seq_parallel_attn is not None
+        return self.hybrid_seq_parallel_attn(
+            None,
+            query,
+            key,
+            value,
+            dropout_p=0.0,
+            causal=False,
         )
 
     @nvtx.annotate(message="xDiTWanAttnProcessor.__call__", color="red")
@@ -107,24 +150,18 @@ class xDiTWanAttnProcessor(WanAttnProcessor2_0):
                 message="hybrid_seq_parallel_attn_img",
                 color="red",
             ):
-                hidden_states_img = self.hybrid_seq_parallel_attn(
-                    None,
+                hidden_states_img = self._run_attention(
                     query,
                     key_img.transpose(1, 2),
                     value_img.transpose(1, 2),
-                    dropout_p=0.0,
-                    causal=False,
                 )
             hidden_states_img = hidden_states_img.flatten(2, 3).type_as(query)
 
         with nvtx.annotate(message="hybrid_seq_parallel_attn", color="red"):
-            hidden_states = self.hybrid_seq_parallel_attn(
-                None,
+            hidden_states = self._run_attention(
                 query,
                 key.transpose(1, 2),
                 value.transpose(1, 2),
-                dropout_p=0.0,
-                causal=False,
             )
         hidden_states = hidden_states.flatten(2, 3).type_as(query)
         if hidden_states_img is not None:
