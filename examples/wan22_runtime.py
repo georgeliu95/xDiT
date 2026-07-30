@@ -121,6 +121,12 @@ def build_pipeline(
     device: str,
     boundary_ratio: float | None,
 ) -> WanPipeline:
+    # The pipeline is constructed without either expert, so pipe.to(device)
+    # cannot move them.  Complete resident placement before attaching the
+    # experts; otherwise skipped BF16 modules such as patch_embedding remain
+    # on CPU while the latent input is on CUDA.
+    transformer_high = transformer_high.to(device)
+    transformer_low = transformer_low.to(device)
     pipe = WanPipeline.from_pretrained(
         pretrained_model_name_or_path=model_id,
         vae=vae.to(device),
