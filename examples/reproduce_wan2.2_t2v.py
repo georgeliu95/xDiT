@@ -13,16 +13,11 @@ import torch.distributed as dist
 from diffusers.utils import export_to_video
 from torch.distributed.elastic.multiprocessing.errors import record
 
-from xfuser.core.distributed import (
-    get_sequence_parallel_rank,
-    get_sequence_parallel_world_size,
-    init_distributed_environment,
-    initialize_model_parallel,
-)
+from xfuser.core.distributed import init_distributed_environment
 from xfuser.logger import init_logger
 
 from fsdp import shard_model
-from wan_runtime import get_system_memory_info
+from wan_runtime import get_system_memory_info, initialize_wan_sequence_parallel
 from wan_t2v_parallel import parallelize_transformer, validate_wan_fa4_request
 from wan22_runtime import (
     apply_quantization,
@@ -51,16 +46,10 @@ def main(args) -> None:
     device = f"cuda:{local_rank}"
     torch.cuda.set_device(local_rank)
 
-    if args.ulysses_degree > 1:
-        initialize_model_parallel(
-            sequence_parallel_degree=args.ulysses_degree,
-            ulysses_degree=args.ulysses_degree,
-        )
-        sp_size = get_sequence_parallel_world_size()
-        sp_rank = get_sequence_parallel_rank()
-    else:
-        sp_size = 1
-        sp_rank = 0
+    sp_size, sp_rank = initialize_wan_sequence_parallel(
+        ulysses_degree=args.ulysses_degree,
+        ring_degree=args.ring_degree,
+    )
 
     model_id = args.model_id
     shard_fn = partial(shard_model, device_id=local_rank)

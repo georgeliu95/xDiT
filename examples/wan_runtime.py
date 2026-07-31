@@ -1,4 +1,4 @@
-"""Shared host-memory and Wan2.1 model-loading helpers for legacy runners."""
+"""Shared runtime helpers for legacy Wan runners."""
 
 from __future__ import annotations
 
@@ -11,10 +11,30 @@ import torch.distributed as dist
 from diffusers import AutoencoderKLWan, WanPipeline
 from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
 
+from xfuser.core.distributed import (
+    get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
+    initialize_model_parallel,
+)
 from xfuser.logger import init_logger
 
 
 logger = init_logger(__name__)
+
+
+def initialize_wan_sequence_parallel(
+    ulysses_degree: int,
+    ring_degree: int,
+) -> tuple[int, int]:
+    """Initialize Wan sequence parallelism and return its world size and rank."""
+    if ulysses_degree == 1 and ring_degree == 1:
+        return 1, 0
+
+    initialize_model_parallel(
+        ulysses_degree=ulysses_degree,
+        ring_degree=ring_degree,
+    )
+    return get_sequence_parallel_world_size(), get_sequence_parallel_rank()
 
 
 class SystemMemoryInfoKeyError(KeyError):
