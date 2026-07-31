@@ -1,3 +1,4 @@
 [submodule "tllm_linear_lite"]
 	path = third_party/tllm_linear_lite
-	url = git@github.com:georgeliu95/tllm_linear_lite.git
+	url = https://github.com/georgeliu95/tllm_linear_lite.git
+	branch = main
