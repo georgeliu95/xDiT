@@ -34,7 +34,7 @@ if __name__ == "__main__":
             "distvae",
             "yunchang>=0.6.0",
             "einops",
-            "diffusers>=0.33.0",
+            "diffusers>=0.35.2",
             "av", # For LTX-2 model
             "peft", # For LTX-2 LoRA
             "numba",
