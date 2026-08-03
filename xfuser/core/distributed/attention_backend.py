@@ -441,7 +441,13 @@ class AttentionBackendType(Enum):
     FLASH_4 = "Flash Attention V4"
     FLASH_4_FP4 = "Flash Attention V4 FP4"
     FLASHINFER_NVFP4 = "FlashInfer SM12x NVFP4"
+    FLASHINFER = "FlashInfer"
     SAGE = "Sage Attention"
+    SAGE_FP16 = "Sage Attention FP16"
+    SAGE_FP8 = "Sage Attention FP8"
+    SAGE_FP8_SM90 = "Sage Attention FP8 SM90"
+    SAGE_FP16_TRITON = "Sage Attention FP16 Triton"
+    SPARSE_SAGE = "Sparse Sage Attention"
     FLEX_BLOCK_ATTN = "Flex Block Attention"
     AITER = "AITER"
     AITER_FP8 = "AITER FP8"
@@ -455,6 +461,25 @@ class AttentionBackendType(Enum):
     FLEX_BLOCK_SPARGE = "Flex Block Sparge"
     AITER_FLYDSL = "AITER FlyDSL"
     NPU = "NPU"
+
+
+ATTENTION_BACKEND_ALIASES = {
+    "torch": "sdpa",
+    "fa": "flash",
+    "fa3": "flash_3",
+    "fa4": "flash_4",
+    "sage_auto": "sage",
+}
+
+
+def parse_attention_backend(name: str) -> AttentionBackendType:
+    """Parse canonical backend names and the retired Wan runner aliases."""
+    canonical_name = ATTENTION_BACKEND_ALIASES.get(name.lower(), name)
+    try:
+        return AttentionBackendType[canonical_name.upper()]
+    except KeyError as error:
+        raise ValueError(f"Invalid attention backend: {name}") from error
+
 
 def register_attention_function(backend_type):
     """
@@ -727,6 +752,22 @@ def _flashinfer_nvfp4_attn_call(
         is_causal=is_causal,
         per_block_mean=per_block_mean,
     )
+
+
+@register_attention_function(AttentionBackendType.FLASHINFER)
+def _flashinfer_attn_call(
+    query, key, value, dropout_p, is_causal, attention_kwargs=None
+):
+    from xfuser.core.distributed.nvidia_attention import flashinfer_attention
+
+    return flashinfer_attention(
+        query,
+        key,
+        value,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+    )
+
 
 def _fp8_hadamard_rotate(x: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
     """Orthonormal Hadamard rotation along head_dim (in blocks of R.shape[-1]).
@@ -1008,6 +1049,78 @@ def _sage_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=No
         return_lse=True
     )
     return output, softmax_lse
+
+
+def _explicit_sage_attn_call(query, key, value, is_causal, implementation):
+    from xfuser.core.distributed.nvidia_attention import sage_attention
+
+    return sage_attention(
+        query,
+        key,
+        value,
+        is_causal=is_causal,
+        implementation=implementation,
+    )
+
+
+@register_attention_function(AttentionBackendType.SAGE_FP16)
+def _sage_fp16_attn_call(
+    query, key, value, dropout_p, is_causal, attention_kwargs=None
+):
+    from xfuser.core.distributed.nvidia_attention import SageImplementation
+
+    return _explicit_sage_attn_call(
+        query, key, value, is_causal, SageImplementation.FP16
+    )
+
+
+@register_attention_function(AttentionBackendType.SAGE_FP8)
+def _sage_fp8_attn_call(
+    query, key, value, dropout_p, is_causal, attention_kwargs=None
+):
+    from xfuser.core.distributed.nvidia_attention import SageImplementation
+
+    return _explicit_sage_attn_call(
+        query, key, value, is_causal, SageImplementation.FP8
+    )
+
+
+@register_attention_function(AttentionBackendType.SAGE_FP8_SM90)
+def _sage_fp8_sm90_attn_call(
+    query, key, value, dropout_p, is_causal, attention_kwargs=None
+):
+    from xfuser.core.distributed.nvidia_attention import SageImplementation
+
+    return _explicit_sage_attn_call(
+        query, key, value, is_causal, SageImplementation.FP8_SM90
+    )
+
+
+@register_attention_function(AttentionBackendType.SAGE_FP16_TRITON)
+def _sage_fp16_triton_attn_call(
+    query, key, value, dropout_p, is_causal, attention_kwargs=None
+):
+    from xfuser.core.distributed.nvidia_attention import SageImplementation
+
+    return _explicit_sage_attn_call(
+        query, key, value, is_causal, SageImplementation.FP16_TRITON
+    )
+
+
+@register_attention_function(AttentionBackendType.SPARSE_SAGE)
+def _sparse_sage_attn_call(
+    query, key, value, dropout_p, is_causal, attention_kwargs=None
+):
+    from xfuser.core.distributed.nvidia_attention import sparse_sage_attention
+
+    return sparse_sage_attention(
+        query,
+        key,
+        value,
+        is_causal=is_causal,
+        attention_kwargs=attention_kwargs,
+    )
+
 
 @torch.library.custom_op("xfuser::flex_block_attn", mutates_args=())
 def flex_block_attn_op(

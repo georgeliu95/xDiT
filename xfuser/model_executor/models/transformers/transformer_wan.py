@@ -45,6 +45,21 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         # (SSTA / sparge) to receive layout info like `thw`. Cross-attention and
         # the I2V image-context sub-call below are dense, so they don't read it.
         self.attention_kwargs = attention_kwargs
+        self.sparse_sage_processor = None
+
+    def _get_attention_kwargs(self, backend: AttentionBackendType | None):
+        effective_backend = backend or get_runtime_state().attention_backend
+        if effective_backend != AttentionBackendType.SPARSE_SAGE:
+            return self.attention_kwargs
+        if self.sparse_sage_processor is None:
+            from xfuser.core.distributed.nvidia_attention import (
+                create_sparse_sage_processor,
+            )
+
+            self.sparse_sage_processor = create_sparse_sage_processor()
+        kwargs = dict(self.attention_kwargs or {})
+        kwargs["sparse_sage_processor"] = self.sparse_sage_processor
+        return kwargs
 
     def _get_qkv_projections(self, attn: "WanAttention", hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor):
         # encoder_hidden_states is only passed for cross-attention
@@ -145,12 +160,13 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
 
             key_img = key_img.unflatten(2, (attn.heads, -1))
             value_img = value_img.unflatten(2, (attn.heads, -1))
+            image_backend = runtime_state.get_cross_attention_backend()
 
             hidden_states_img = self.attention_function(query.transpose(1, 2),
                                                         key_img.transpose(1, 2),
                                                         value_img.transpose(1, 2),
-                                                        backend=backend,
-                                                        attention_kwargs=self.attention_kwargs,
+                                                        backend=image_backend,
+                                                        attention_kwargs=self._get_attention_kwargs(image_backend),
                                                         ).transpose(1, 2)
             hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
@@ -161,7 +177,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             key.transpose(1, 2),
             value.transpose(1, 2),
             backend=backend,
-            attention_kwargs=self.attention_kwargs,
+            attention_kwargs=self._get_attention_kwargs(backend),
             head_balance_layer=attn,
         ).transpose(1, 2)
 

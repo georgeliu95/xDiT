@@ -26,7 +26,10 @@ if envs._is_npu():
     from torch.npu import manual_seed as device_manual_seed
     from torch.npu import manual_seed_all as device_manual_seed_all
 
-from xfuser.core.distributed.attention_backend import AttentionBackendType
+from xfuser.core.distributed.attention_backend import (
+    AttentionBackendType,
+    parse_attention_backend,
+)
 from xfuser.core.distributed.attention_schedule import AttentionSchedule, GemmPrecisionSchedule
 from xfuser.core.distributed.flashinfer_nvfp4 import FlashInferNvfp4UnavailableError
 from xfuser.config.config import (
@@ -117,10 +120,7 @@ class RuntimeState(metaclass=ABCMeta):
         Given attention_backend can be either AttentionBackendType or a string with the name of the backend.
         """
         if isinstance(attention_backend, str):
-            try:
-                attention_backend = AttentionBackendType[attention_backend.upper()]
-            except:
-                pass
+            attention_backend = parse_attention_backend(attention_backend)
 
         if not isinstance(attention_backend, AttentionBackendType):
             raise ValueError(f"Value '{attention_backend}' is not a valid attention backend.")
@@ -128,7 +128,7 @@ class RuntimeState(metaclass=ABCMeta):
         self._check_if_backend_compatible_with_current_configuration(attention_backend)
         self.attention_backend = attention_backend
         logger.warning("Using {} as attention backend.".format(self.attention_backend.name))
-        if attention_backend in [AttentionBackendType.FLASH_3_FP8, AttentionBackendType.AITER_FP8, AttentionBackendType.NVTE_FP8, AttentionBackendType.FLASH_4_FP4, AttentionBackendType.FLASHINFER_NVFP4, AttentionBackendType.AITER_MLA]:
+        if attention_backend in [AttentionBackendType.FLASH_3_FP8, AttentionBackendType.AITER_FP8, AttentionBackendType.NVTE_FP8, AttentionBackendType.FLASH_4_FP4, AttentionBackendType.FLASHINFER_NVFP4, AttentionBackendType.AITER_MLA, AttentionBackendType.SAGE_FP8, AttentionBackendType.SAGE_FP8_SM90]:
             logger.warning("Low-precision attention backend is enabled. This may cause poor quality outputs, consider using hybrid attention if possible.")
 
 
@@ -142,14 +142,18 @@ class RuntimeState(metaclass=ABCMeta):
                     "FlashInfer NVFP4 supports only same-shape self-attention; "
                     "set an explicit non-NVFP4 cross-attention backend."
                 )
+            if self.attention_backend == AttentionBackendType.SPARSE_SAGE:
+                raise ValueError(
+                    "Sparse Sage is a self-attention backend; set an explicit "
+                    "dense cross-attention backend."
+                )
             self.cross_attention_backend = None
             return
 
         if isinstance(cross_attention_backend, str):
-            try:
-                cross_attention_backend = AttentionBackendType[cross_attention_backend.upper()]
-            except:
-                pass
+            cross_attention_backend = parse_attention_backend(
+                cross_attention_backend
+            )
 
         if not isinstance(cross_attention_backend, AttentionBackendType):
             raise ValueError(f"Value '{cross_attention_backend}' is not a valid attention backend.")
@@ -158,6 +162,11 @@ class RuntimeState(metaclass=ABCMeta):
             raise ValueError(
                 "FlashInfer NVFP4 cannot be used for cross-attention because "
                 "it requires query, key, and value tensors with identical shapes."
+            )
+        if cross_attention_backend == AttentionBackendType.SPARSE_SAGE:
+            raise ValueError(
+                "Sparse Sage is a self-attention backend; choose a dense "
+                "cross-attention backend."
             )
 
         self._check_if_backend_compatible_with_current_configuration(cross_attention_backend)
@@ -179,7 +188,9 @@ class RuntimeState(metaclass=ABCMeta):
         (meaning the main attention_backend will be used).
         """
         if engine_config and engine_config.runtime_config.cross_attention_backend:
-            return AttentionBackendType[engine_config.runtime_config.cross_attention_backend.upper()]
+            return parse_attention_backend(
+                engine_config.runtime_config.cross_attention_backend
+            )
         return None
 
     def _select_attention_backend(self, engine_config: Optional[EngineConfig] = None):
@@ -187,7 +198,9 @@ class RuntimeState(metaclass=ABCMeta):
         Select the best attention backend for the current environment.
         """
         if engine_config and engine_config.runtime_config.attention_backend:
-            backend = AttentionBackendType[engine_config.runtime_config.attention_backend.upper()]
+            backend = parse_attention_backend(
+                engine_config.runtime_config.attention_backend
+            )
 
         elif envs._is_hip():
             if env_info["has_aiter"] and PACKAGES_CHECKER._on_rdna4():
@@ -233,7 +246,8 @@ class RuntimeState(metaclass=ABCMeta):
                                  AttentionBackendType.AITER_SPARGE_V2,
                                  AttentionBackendType.AITER_FLYDSL,
                                  AttentionBackendType.FLEX_BLOCK_ATTN,
-                                 AttentionBackendType.FLEX_BLOCK_SPARGE]:
+                                 AttentionBackendType.FLEX_BLOCK_SPARGE,
+                                 AttentionBackendType.SPARSE_SAGE]:
             if self.parallel_config.ring_degree > 1:
                 # Ring parallelism merges per-rank attention outputs via LSE, so
                 # the wrapper must expose return_lse (and, for AITER_SAGE,
@@ -278,6 +292,14 @@ class RuntimeState(metaclass=ABCMeta):
                 "with the NVFP4 fixes from PRs #3838 and #3897"
             )
 
+        if attention_backend == AttentionBackendType.FLASHINFER:
+            try:
+                import flashinfer.prefill
+            except ImportError:
+                raise RuntimeError(
+                    "FlashInfer attention is not available; install flashinfer-python."
+                ) from None
+
         if attention_backend == AttentionBackendType.AITER_FP8:
             try:
                 from aiter import flash_attn_fp8_pertensor_func
@@ -315,9 +337,22 @@ class RuntimeState(metaclass=ABCMeta):
                     "Flash Attention V4 FP4 is not available. Requires Blackwell GPU (SM >= 10.0) "
                     "and the hao-ai-lab/flash-attention-fp4 fork with nvidia-cutlass-dsl."
                 )
-        elif attention_backend == AttentionBackendType.SAGE:
+        elif attention_backend in (
+            AttentionBackendType.SAGE,
+            AttentionBackendType.SAGE_FP16,
+            AttentionBackendType.SAGE_FP8,
+            AttentionBackendType.SAGE_FP8_SM90,
+            AttentionBackendType.SAGE_FP16_TRITON,
+        ):
             if not env_info["has_sage"]:
                 raise RuntimeError("SageAttention is not available, please install SageAttention.")
+        elif attention_backend == AttentionBackendType.SPARSE_SAGE:
+            try:
+                import spas_sage_attn.autotune
+            except ImportError:
+                raise RuntimeError(
+                    "Sparse Sage attention is not available; install SpargeAttn."
+                ) from None
         elif attention_backend == AttentionBackendType.AITER_SPARGE:
             msg = "AITER Sparge attention is not available, please update AITER"
             try:

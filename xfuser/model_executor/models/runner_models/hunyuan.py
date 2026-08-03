@@ -264,6 +264,7 @@ class xFuserHunyuanvideo15SparseModel(xFuserHunyuanvideo15Model):
         enable_slicing=True,
         enable_tiling=True,
         supports_sparse_attention_backends=True,
+        requires_sparse_attention_backend=True,
     )
 
     def _validate_ssta_attention_kwargs(self, attn_param: dict) -> None:

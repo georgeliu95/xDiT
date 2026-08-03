@@ -45,8 +45,16 @@ from xfuser.core.distributed import (
     init_distributed_environment,
     shard_component,
 )
-from xfuser.core.distributed.attention_backend import AttentionBackendType
+from xfuser.core.distributed.attention_backend import (
+    AttentionBackendType,
+    parse_attention_backend,
+)
 from xfuser.core.distributed.attention_schedule import AttentionSchedule, create_hybrid_attn_schedule, create_hybrid_gemm_schedule
+from xfuser.model_executor.quantization.linear_backend import (
+    LinearBackendType,
+    parse_linear_backend,
+    uses_tllm_linear_lite,
+)
 
 
 packages_info = PACKAGES_CHECKER.get_packages_info()
@@ -62,6 +70,7 @@ def register_model(name: str) -> Callable:
 
 
 _SPARSE_ATTENTION_BACKENDS = frozenset({
+    AttentionBackendType.SPARSE_SAGE,
     AttentionBackendType.AITER_SPARSE_SAGE,
     AttentionBackendType.AITER_SPARSE_SAGE_V2,
     AttentionBackendType.FLEX_BLOCK_ATTN
@@ -71,33 +80,34 @@ _SPARGE_ATTENTION_BACKENDS = frozenset({
     AttentionBackendType.AITER_SPARGE_V2,
     AttentionBackendType.FLEX_BLOCK_SPARGE,
 })
+_SELF_ATTENTION_ONLY_BACKENDS = _SPARGE_ATTENTION_BACKENDS | {
+    AttentionBackendType.SPARSE_SAGE,
+}
 
 
 def _parse_attention_backend(name: Optional[str], kind: str) -> Optional[AttentionBackendType]:
     if name is None:
         return None
     try:
-        return AttentionBackendType[name.upper()]
-    except KeyError:
-        raise ValueError(f"Invalid {kind}: {name}")
+        return parse_attention_backend(name)
+    except ValueError as error:
+        raise ValueError(f"Invalid {kind}: {name}") from error
 
 
-def _validate_cross_attention_for_sparge(config: xFuserArgs) -> None:
-    """Cross-attention must be set and must not itself be a Sparge backend
-    whenever Sparge Attention is in play (either as the explicit backend or
-    via the hybrid schedule)."""
+def _validate_cross_attention_for_sparse_backend(config: xFuserArgs) -> None:
+    """Require a dense cross-attention backend for self-attention-only kernels."""
     if config.cross_attention_backend is None:
         raise ValueError(
-            "When Sparge Attention is used, --cross_attention_backend must be "
-            "set to a non-Sparge backend."
+            "When a self-attention-only sparse backend is used, "
+            "--cross_attention_backend must be set to a dense backend."
         )
     cross = _parse_attention_backend(
         config.cross_attention_backend, "cross attention backend",
     )
-    if cross in _SPARGE_ATTENTION_BACKENDS:
+    if cross in _SELF_ATTENTION_ONLY_BACKENDS:
         raise ValueError(
-            f"--cross_attention_backend cannot be {cross.name} when Sparge "
-            f"Attention is used. Pick a non-Sparge cross attention backend."
+            f"--cross_attention_backend cannot be {cross.name}; choose a "
+            "dense cross-attention backend."
         )
 
 
@@ -127,6 +137,7 @@ class ModelCapabilities:
     use_hybrid_gemm_schedule: bool = False
     cross_attention_backend: bool = False
     supports_sparse_attention_backends: bool = False
+    requires_sparse_attention_backend: bool = False
     supports_sparge_attention_backends: bool = False
     supports_distilled_weights: bool = False
 
@@ -309,10 +320,11 @@ class xFuserModel(abc.ABC):
 
         backend = _parse_attention_backend(config.attention_backend, "attention backend")
         supports_sparse = self.capabilities.supports_sparse_attention_backends
+        requires_sparse = self.capabilities.requires_sparse_attention_backend
         supports_sparge = self.capabilities.supports_sparge_attention_backends
 
         if backend is None:
-            if supports_sparse:
+            if requires_sparse:
                 raise ValueError(
                     f"Model {config.model} supports sparse attention backends, "
                     f"but no attention backend was specified. Please specify a "
@@ -329,15 +341,17 @@ class xFuserModel(abc.ABC):
                     config.hybrid_attn_high_precision_backend,
                     "hybrid high-precision attention backend",
                 )
-                if (low in _SPARGE_ATTENTION_BACKENDS
-                        or high in _SPARGE_ATTENTION_BACKENDS):
-                    _validate_cross_attention_for_sparge(config)
+                if (
+                    low in _SELF_ATTENTION_ONLY_BACKENDS
+                    or high in _SELF_ATTENTION_ONLY_BACKENDS
+                ):
+                    _validate_cross_attention_for_sparse_backend(config)
         else:
             if backend in _SPARSE_ATTENTION_BACKENDS and not supports_sparse:
                 raise ValueError(
                     f"Model {config.model} does not support sparse attention backends."
                 )
-            if supports_sparse and backend not in _SPARSE_ATTENTION_BACKENDS:
+            if requires_sparse and backend not in _SPARSE_ATTENTION_BACKENDS:
                 raise ValueError(
                     f"Model {config.model} supports sparse attention backends, but "
                     f"attention backend '{config.attention_backend}' was specified. "
@@ -346,13 +360,13 @@ class xFuserModel(abc.ABC):
                     f"If you want to use a dense attention backend, use the dense "
                     f"model equivalent."
                 )
-            if backend in _SPARGE_ATTENTION_BACKENDS:
-                if not supports_sparge:
-                    raise ValueError(
-                        f"Model {config.model} does not support Sparge attention backend."
-                    )
+            if backend in _SPARGE_ATTENTION_BACKENDS and not supports_sparge:
+                raise ValueError(
+                    f"Model {config.model} does not support Sparge attention backend."
+                )
+            if backend in _SELF_ATTENTION_ONLY_BACKENDS:
                 if self.capabilities.cross_attention_backend:
-                    _validate_cross_attention_for_sparge(config)
+                    _validate_cross_attention_for_sparse_backend(config)
 
         possible_task = getattr(config, "task", None)
         if possible_task and self.settings.valid_tasks:
@@ -373,7 +387,39 @@ class xFuserModel(abc.ABC):
                 raise ValueError("Cannot use int8 gemms with fp8 or fp4 gemms.")
             if _is_hip():
                 raise ValueError("Int8 GEMMs on ROCm are not supported.")
-            
+
+        linear_backend = parse_linear_backend(config.linear_backend)
+        if linear_backend in {
+            LinearBackendType.TORCHAO_FP8,
+            LinearBackendType.TORCHAO_NVFP4,
+        } and not _is_cuda():
+            raise ValueError(
+                f"Linear backend {linear_backend.value} requires NVIDIA CUDA."
+            )
+        if linear_backend in {
+            LinearBackendType.AITER_MXFP4,
+        } and not _is_hip():
+            raise ValueError(
+                f"Linear backend {linear_backend.value} requires AMD ROCm/AITER."
+            )
+        if (
+            linear_backend == LinearBackendType.AITER_FP8_BLOCKWISE
+            and not _use_aiter_fp8_rdna4()
+        ):
+            raise ValueError(
+                "Linear backend aiter-fp8-blockwise requires AITER on an "
+                "RDNA4 GPU."
+            )
+        if uses_tllm_linear_lite(linear_backend):
+            if not _is_cuda():
+                raise ValueError(
+                    f"Linear backend {linear_backend.value} requires NVIDIA CUDA."
+                )
+            if config.enable_model_cpu_offload or config.enable_sequential_cpu_offload:
+                raise ValueError(
+                    "tllm_linear_lite backends do not support model CPU offload."
+                )
+
         if config.use_fp4_gemms:
             if _is_hip() and not packages_info.get("has_aiter", False):
                 raise ValueError("FP4 GEMMs on ROCm require AITER.")
@@ -677,6 +723,8 @@ class xFuserModel(abc.ABC):
         """ Hook for any post model-load and state initialization """
 
         local_rank = get_world_group().local_rank
+        linear_backend = parse_linear_backend(self.config.linear_backend)
+        use_tllm = uses_tllm_linear_lite(linear_backend)
         # Log FP8 precision overrides once here rather than per module/block in the
         # quantization and FSDP-sharding loops below (avoids duplicate log spam).
         if self.config.use_fp4_gemms:
@@ -693,20 +741,28 @@ class xFuserModel(abc.ABC):
             )
             # AITER FP8: quantizes layer-by-layer CPU→GPU individually before pipe.to(cuda).
             # All other quant paths (FP4, torchao FP8) need weights on GPU first.
-            if self.config.use_fp8_gemms and _use_aiter_fp8_rdna4():
+            if self.config.use_fp8_gemms and _use_aiter_fp8_rdna4() and not use_tllm:
                 for module_name in self.settings.fp8_gemm_module_list:
                     log(f"Quantizing {module_name} to FP8 block-scale (AITER)...")
                     quantize_linear_layers_to_fp8_blockscale(
                         rgetattr(self.pipe, module_name), device=f"cuda:{local_rank}"
                     )
+            if use_tllm:
+                self._setup_tllm_linear_gemms(
+                    linear_backend, local_rank=local_rank
+                )
             if not offload_requested:
                 self.pipe = self.pipe.to(f"cuda:{local_rank}")
-            if self.config.use_fp4_gemms:
+            if self.config.use_fp4_gemms and not use_tllm:
                 if _is_cuda():
                     self._setup_nvfp4_gemms(local_rank=local_rank)
                 else:
                     self._setup_mxfp4_gemms(local_rank=local_rank)
-            if self.config.use_fp8_gemms and not _use_aiter_fp8_rdna4():
+            if (
+                self.config.use_fp8_gemms
+                and not _use_aiter_fp8_rdna4()
+                and not use_tllm
+            ):
                 for module_name in self.settings.fp8_gemm_module_list:
                     log(f"Quantizing {module_name} to FP8 (torchao)...")
                     quantize_linear_layers_to_fp8(rgetattr(self.pipe, module_name), device=f"cuda:{local_rank}")
@@ -730,7 +786,12 @@ class xFuserModel(abc.ABC):
 
     def _shard_model_with_fsdp(self) -> None:
         """ Shard the model with FSDP based on settings """
-        if self.config.use_fp8_gemms and _is_cuda():
+        linear_backend = parse_linear_backend(self.config.linear_backend)
+        if (
+            self.config.use_fp8_gemms
+            and _is_cuda()
+            and not uses_tllm_linear_lite(linear_backend)
+        ):
             from xfuser.core.utils.runner_utils import _TORCHAO_FLOAT8_FSDP2_PATCHES
             assert _TORCHAO_FLOAT8_FSDP2_PATCHES, (
                 "FSDP2 + FP8 requires torchao Float8Tensor patches but they failed to apply at "
@@ -846,6 +907,44 @@ class xFuserModel(abc.ABC):
         if not use_fp4_here and not use_fp8_here and not use_int8_here:
             return None
 
+        linear_backend = parse_linear_backend(self.config.linear_backend)
+        if uses_tllm_linear_lite(linear_backend):
+            from xfuser.model_executor.quantization.tllm_config import (
+                TllmLinearOptions,
+            )
+            from xfuser.model_executor.quantization.tllm_replace import (
+                TllmConversionState,
+                replace_tllm_linear_layers,
+            )
+
+            options = TllmLinearOptions.from_config(self.config)
+            conversion_state = TllmConversionState()
+            selected_backend = self._tllm_backend_for_precision_slot(
+                linear_backend,
+                use_fp4=use_fp4_here,
+            )
+
+            def tllm_quantize_fn(block, block_idx: int) -> None:
+                block_prefix = f"{block_idx}."
+                local_fp8 = tuple(
+                    override[len(block_prefix):]
+                    for override in fp8_overrides
+                    if override.startswith(block_prefix)
+                ) or None
+                replace_tllm_linear_layers(
+                    block,
+                    selected_backend,
+                    options,
+                    device=device,
+                    fp8_override_prefixes=local_fp8 if use_fp4_here else None,
+                    fp8_override_suffixes=(
+                        fp8_suffix_overrides if use_fp4_here else None
+                    ),
+                    conversion_state=conversion_state,
+                )
+
+            return tllm_quantize_fn
+
         def quantize_fn(block, block_idx: int) -> None:
             block_prefix = f"{block_idx}."
             # Strip the block-index prefix so the quantize functions see local FQN paths.
@@ -878,6 +977,74 @@ class xFuserModel(abc.ABC):
                 quantize_linear_layers_to_int8(block, device=device, min_layer_size=512)
 
         return quantize_fn
+
+    @staticmethod
+    def _tllm_backend_for_precision_slot(
+        backend: LinearBackendType,
+        *,
+        use_fp4: bool,
+    ) -> LinearBackendType:
+        """Preserve the FP4/FP8 split used by dual-transformer models."""
+        if use_fp4:
+            return backend
+        if backend == LinearBackendType.TLLM_SVDQUANT_NVFP4_FUSED:
+            return LinearBackendType.TLLM_SVDQUANT_FP8_BLOCKWISE
+        if backend in {
+            LinearBackendType.TLLM_NVFP4,
+            LinearBackendType.TLLM_NVFP4_FP8_BLOCKWISE,
+        }:
+            return LinearBackendType.TLLM_FP8_BLOCKWISE
+        return backend
+
+    def _setup_tllm_linear_gemms(
+        self,
+        backend: LinearBackendType,
+        *,
+        local_rank: int,
+    ) -> None:
+        """Apply one tllm backend to every configured quantization subtree."""
+        from xfuser.model_executor.quantization.tllm_config import (
+            TllmLinearOptions,
+        )
+        from xfuser.model_executor.quantization.tllm_replace import (
+            TllmConversionState,
+            replace_tllm_linear_layers,
+        )
+
+        options = TllmLinearOptions.from_config(self.config)
+        conversion_state = TllmConversionState()
+        fp4_modules = set(self.settings.fp4_gemm_module_list or ())
+        fp8_modules = set(self.settings.fp8_gemm_module_list or ())
+        if self.config.use_fp4_gemms:
+            module_names = fp4_modules | fp8_modules
+        else:
+            module_names = fp8_modules
+
+        for module_name in sorted(module_names):
+            use_fp4 = module_name in fp4_modules and self.config.use_fp4_gemms
+            selected_backend = self._tllm_backend_for_precision_slot(
+                backend,
+                use_fp4=use_fp4,
+            )
+            log(
+                f"Quantizing {module_name} with tllm_linear_lite "
+                f"backend {selected_backend.value}..."
+            )
+            replace_tllm_linear_layers(
+                rgetattr(self.pipe, module_name),
+                selected_backend,
+                options,
+                device=f"cuda:{local_rank}",
+                fp8_override_prefixes=(
+                    self.settings.fp8_precision_overrides if use_fp4 else None
+                ),
+                fp8_override_suffixes=(
+                    self.settings.fp8_precision_override_suffixes
+                    if use_fp4
+                    else None
+                ),
+                conversion_state=conversion_state,
+            )
 
     def _setup_mxfp4_gemms(self, local_rank):
         for module_name in self.settings.fp4_gemm_module_list:

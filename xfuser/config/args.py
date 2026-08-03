@@ -139,8 +139,25 @@ class xFuserArgs:
     use_int8_gemms: bool = False
     use_fp8_gemms: bool = False
     use_fp4_gemms: bool = False
+    linear_backend: Optional[str] = None
     fp8_precision_override_prefix_patterns: Optional[str] = None
     fp8_precision_override_suffix_patterns: Optional[str] = None
+    # tllm_linear_lite arguments. Backend strings are validated by the dependency.
+    tllm_nvfp4_gemm_backend: str = "heuristic"
+    tllm_nvfp4_quant_backend: str = "tllm"
+    tllm_nvfp4_scale_rule: str = "static_6"
+    tllm_fp8_gemm_backend: str = "auto"
+    tllm_svdquant_rank: int = 32
+    tllm_svdquant_alpha: float = 0.5
+    tllm_svdquant_method: str = "svd"
+    tllm_svdquant_use_ue8m0: bool = False
+    tllm_svdquant_activation_amax: Optional[float] = None
+    tllm_svdquant_gscale_x: Optional[float] = None
+    tllm_svdquant_clone_output: bool = True
+    tllm_svdquant_max_cached_states: int = 4
+    tllm_svdquant_clear_cache_after_forward: bool = False
+    tllm_svdquant_nvfp4_state_cache_budget_gb: Optional[float] = None
+    tllm_svdquant_nvfp4_state_m: int = 7800
     # Model runner specific
     num_iterations: int = 1
     profile: bool = False
@@ -179,6 +196,25 @@ class xFuserArgs:
     # Distilled model weight paths
     distilled_transformer_path: Optional[str] = None
     distilled_transformer_2_path: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        from xfuser.model_executor.quantization.linear_backend import (
+            FP4_LINEAR_BACKENDS,
+            FP8_LINEAR_BACKENDS,
+            parse_linear_backend,
+        )
+
+        backend = parse_linear_backend(self.linear_backend)
+        if backend is None:
+            return
+        if self.use_int8_gemms or self.use_fp8_gemms or self.use_fp4_gemms:
+            raise ValueError(
+                "--linear_backend cannot be combined with the legacy "
+                "--use_int8_gemms/--use_fp8_gemms/--use_fp4_gemms flags."
+            )
+        self.linear_backend = backend.value
+        self.use_fp4_gemms = backend in FP4_LINEAR_BACKENDS
+        self.use_fp8_gemms = backend in FP8_LINEAR_BACKENDS
 
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser):
@@ -627,6 +663,72 @@ class xFuserArgs:
             "--use_fp4_gemms",
             action="store_true",
             help="Quantize the transformer linear layers (selected models only).",
+        )
+        parser.add_argument(
+            "--linear_backend",
+            type=nullable_str,
+            default=None,
+            help=(
+                "Unified linear backend. Native and tllm_linear_lite backends "
+                "are selected by name."
+            ),
+        )
+        parser.add_argument(
+            "--tllm_nvfp4_gemm_backend",
+            type=str,
+            default="heuristic",
+            help="NVFP4 GEMM backend passed directly to tllm_linear_lite.",
+        )
+        parser.add_argument(
+            "--tllm_nvfp4_quant_backend",
+            type=str,
+            default="tllm",
+            help="NVFP4 quant backend passed directly to tllm_linear_lite.",
+        )
+        parser.add_argument(
+            "--tllm_nvfp4_scale_rule",
+            type=str,
+            default="static_6",
+            help="NVFP4 scale rule passed directly to tllm_linear_lite.",
+        )
+        parser.add_argument(
+            "--tllm_fp8_gemm_backend",
+            type=str,
+            default="auto",
+            help="FP8 GEMM backend passed directly to tllm_linear_lite.",
+        )
+        parser.add_argument("--tllm_svdquant_rank", type=int, default=32)
+        parser.add_argument("--tllm_svdquant_alpha", type=float, default=0.5)
+        parser.add_argument("--tllm_svdquant_method", type=str, default="svd")
+        parser.add_argument(
+            "--tllm_svdquant_use_ue8m0",
+            action="store_true",
+            default=False,
+        )
+        parser.add_argument(
+            "--tllm_svdquant_activation_amax", type=float, default=None
+        )
+        parser.add_argument("--tllm_svdquant_gscale_x", type=float, default=None)
+        parser.add_argument(
+            "--tllm_svdquant_clone_output",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+        )
+        parser.add_argument(
+            "--tllm_svdquant_max_cached_states", type=int, default=4
+        )
+        parser.add_argument(
+            "--tllm_svdquant_clear_cache_after_forward",
+            action="store_true",
+            default=False,
+        )
+        parser.add_argument(
+            "--tllm_svdquant_nvfp4_state_cache_budget_gb",
+            type=float,
+            default=None,
+        )
+        parser.add_argument(
+            "--tllm_svdquant_nvfp4_state_m", type=int, default=7800
         )
         parser.add_argument(
             "--fp8_precision_override_prefix_patterns",

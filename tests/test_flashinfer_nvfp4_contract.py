@@ -11,10 +11,6 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WAN_RUNNERS = (
-    "examples/reproduce_wan2.1_t2v.py",
-    "examples/reproduce_wan2.2_t2v.py",
-)
 
 
 def _tree(relative_path: str) -> ast.Module:
@@ -41,26 +37,6 @@ def _calls_named(node: ast.AST, name: str) -> tuple[ast.Call, ...]:
             isinstance(candidate.func, ast.Name) and candidate.func.id == name
             or isinstance(candidate.func, ast.Attribute) and candidate.func.attr == name
         )
-    )
-
-
-def _choice_strings(tree: ast.Module, flag: str) -> tuple[str, ...]:
-    call = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "add_argument"
-        and node.args
-        and isinstance(node.args[0], ast.Constant)
-        and node.args[0].value == flag
-    )
-    choices = next(keyword.value for keyword in call.keywords if keyword.arg == "choices")
-    assert isinstance(choices, (ast.List, ast.Tuple))
-    return tuple(
-        item.value
-        for item in choices.elts
-        if isinstance(item, ast.Constant) and isinstance(item.value, str)
     )
 
 
@@ -108,10 +84,15 @@ def _runtime_cross_backend_setter():
 
     class Backend(Enum):
         FLASHINFER_NVFP4 = "flashinfer_nvfp4"
+        SPARSE_SAGE = "sparse_sage"
         SDPA_FLASH = "sdpa_flash"
+
+    def parse_attention_backend(name: str):
+        return Backend[name.upper()]
 
     namespace = {
         "AttentionBackendType": Backend,
+        "parse_attention_backend": parse_attention_backend,
         "logger": SimpleNamespace(warning=lambda *_args, **_kwargs: None),
     }
     exec(
@@ -272,39 +253,6 @@ class FlashInferNvfp4ContractTest(unittest.TestCase):
             extras["flashinfer-nvfp4"],
             ("flashinfer-python==0.6.15.dev20260722",),
         )
-
-    def test_wan_runners_expose_distinct_nvfp4_route(self) -> None:
-        # Given: both legacy Wan T2V command-line surfaces.
-        choices = tuple(_choice_strings(_tree(path), "--attn_type") for path in WAN_RUNNERS)
-
-        # When/Then: the new route is explicit and the legacy token remains available.
-        for runner_choices in choices:
-            self.assertIn("flashinfer_nvfp4", runner_choices)
-            self.assertIn("flashinfer", runner_choices)
-
-    def test_wan_routes_only_self_attention_through_nvfp4(self) -> None:
-        # Given: the dedicated legacy Wan configurator.
-        configurator = _function(
-            _tree("examples/wan_t2v_parallel.py"),
-            "configure_wan_flashinfer_nvfp4_single_device",
-        )
-
-        # When: runtime backend assignments are inspected.
-        main_call = _calls_named(configurator, "set_attention_backend")
-        cross_call = _calls_named(configurator, "set_cross_attention_backend")
-
-        # Then: same-shape self-attention uses NVFP4; cross-attention remains BF16.
-        self.assertEqual(len(main_call), 1)
-        self.assertEqual(len(cross_call), 1)
-        self.assertEqual(
-            ast.unparse(main_call[0].args[0]),
-            "AttentionBackendType.FLASHINFER_NVFP4",
-        )
-        self.assertEqual(
-            ast.unparse(cross_call[0].args[0]),
-            "AttentionBackendType.FLASH_4",
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

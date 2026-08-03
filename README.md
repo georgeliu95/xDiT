@@ -306,8 +306,14 @@ Several different attention backends are supported:
 | [Transformer Engine FP8](https://github.com/NVIDIA/TransformerEngine) | nvte_fp8 |
 | [FAv4](https://github.com/Dao-AILab/flash-attention/tree/main/flash_attn/cute) | flash_4 |
 | [FAv4 FP4](https://github.com/hao-ai-lab/flash-attention-fp4) | flash_4_fp4 |
+| [FlashInfer](https://github.com/flashinfer-ai/flashinfer) | flashinfer |
 | [FlashInfer SM120/SM121 NVFP4](https://github.com/flashinfer-ai/flashinfer/pull/3897) | flashinfer_nvfp4 |
 | [SAGE](https://github.com/thu-ml/SageAttention) | sage |
+| [SAGE FP16 CUDA](https://github.com/thu-ml/SageAttention) | sage_fp16 |
+| [SAGE FP8 CUDA](https://github.com/thu-ml/SageAttention) | sage_fp8 |
+| [SAGE FP8 SM90](https://github.com/thu-ml/SageAttention) | sage_fp8_sm90 |
+| [SAGE FP16 Triton](https://github.com/thu-ml/SageAttention) | sage_fp16_triton |
+| [Sparse Sage](https://github.com/thu-ml/SpargeAttn) | sparse_sage |
 | [AITER](https://github.com/rocm/aiter) | aiter |
 | [AITER FP8](https://github.com/rocm/aiter) | aiter_fp8 |
 | [AITER Sage](https://github.com/rocm/aiter) | aiter_sage |
@@ -321,12 +327,11 @@ xDiT comes with `flash_attn` as an optional install requirement, as it currently
 However, newer implementations generally offer better performance. If available for you, we highly recommend using `cuDNN`, `FAv3`, `FAv3 FP8` (on _hopper_ GPUs) or `FAv4`, `Transformer engine FP8` (on _blackwell_ GPUs).
 On recent AMD GPUs (MI300X or newer) it is generally recommended to use `AITER` in all cases to get the best possible performance. Note that when using `AITER FP8` as the attention backend with `torch.compile`, it is important to use a version of `AITER` from Jan 16, 2026 or later. Older versions may trigger a bug related to the fake tensors, resulting in a runtime error.
 
-The unified Wan runner selects FA4 with `--attention_backend flash_4`. The
-legacy Wan2.1/Wan2.2 T2V reproduction scripts accept `--attn_type fa4` for the
-SM120, BF16, single-process (`WORLD_SIZE=1`, `ulysses_degree=1`,
-`ring_degree=1`) path. That legacy path routes both self-attention and
-cross-attention through FA4 and fails closed when the package, GPU capability,
-or parallelism is incompatible.
+Wan2.1 and Wan2.2 use the unified `xdit` runner. Select self- and
+cross-attention independently with `--attention_backend` and
+`--cross_attention_backend`; the retired `--attn_type` scripts are no longer
+maintained. The old names `torch`, `fa`, `fa3`, `fa4`, and `sage_auto` remain
+accepted as compatibility aliases.
 
 FlashInfer NVFP4 is an explicit low-precision backend; xDiT does not select it
 automatically. It requires the pinned `flashinfer-python` nightly containing
@@ -335,15 +340,9 @@ automatically. It requires the pinned `flashinfer-python` nightly containing
 an SM120 or SM121 GPU, FP16/BF16 QKV input, head dimension 64 or 128, and equal
 Q/K/V shapes. SM120 requires CUDA 12.8 or newer; SM121 requires CUDA 12.9 or
 newer. Stable 0.6.14, 0.6.15, and the diverged 0.6.15.post1 release are
-rejected because they do not contain both fixes. The unified runner should
+rejected because they do not contain both fixes. The runner should
 pair `--attention_backend flashinfer_nvfp4` with a BF16 cross-attention backend
-on either SM120 or SM121. The legacy Wan2.1/Wan2.2 scripts expose
-`--attn_type flashinfer_nvfp4`, but that route is SM120-only because it pairs
-NVFP4 self-attention with the legacy BF16 FA4 cross-attention path, which is
-validated only on SM120. The legacy route also supports only a single-process
-run. Their existing `--attn_type sage_fp8` route likewise uses explicit Sage
-FP8 for self-attention and BF16 FA4 for cross-attention on the SM120
-single-process path. The upstream kernel internally zero-pads sequence lengths
+on either SM120 or SM121. The upstream kernel internally zero-pads sequence lengths
 to a multiple of 128;
 xDiT trims the returned output and LSE to the original length. For non-causal
 attention whose sequence length is not 128-aligned, those padded keys remain
@@ -352,6 +351,45 @@ part of the kernel's approximation. xDiT defaults to global centering with
 `[B, H, 1, S]`. Advanced callers can opt into block centering through
 `attention_kwargs`; that uses `[B, H, S/128, S]` and trades additional memory
 for block-local accuracy.
+
+For example, Wan2.2 can use FlashInfer NVFP4 self-attention and FA4
+cross-attention through the same runner:
+
+```bash
+xdit --model Wan2.2-T2V \
+  --attention_backend flashinfer_nvfp4 \
+  --cross_attention_backend flash_4 \
+  --ulysses_degree 1 --ring_degree 1
+```
+
+### Linear backends
+
+The runner exposes one `--linear_backend` switch for native and
+`tllm_linear_lite` implementations:
+
+| Implementation | Backend name |
+| --- | --- |
+| BF16 | `bf16` |
+| TorchAO FP8 | `torchao-fp8` |
+| TorchAO NVFP4 | `torchao-nvfp4` |
+| AITER FP8 blockwise | `aiter-fp8-blockwise` |
+| AITER MXFP4 | `aiter-mxfp4` |
+| tllm_linear_lite NVFP4 | `tllm-nvfp4` |
+| tllm_linear_lite FP8 blockwise | `tllm-fp8-blockwise` |
+| tllm_linear_lite NVFP4 + FP8 blockwise | `tllm-nvfp4-fp8-blockwise` |
+| tllm_linear_lite SVDQuant FP8 blockwise | `tllm-svdquant-fp8-blockwise` |
+| tllm_linear_lite SVDQuant NVFP4 fused | `tllm-svdquant-nvfp4-fused` |
+
+NVFP4 dispatch is configured with `--tllm_nvfp4_gemm_backend`,
+`--tllm_nvfp4_quant_backend`, and `--tllm_nvfp4_scale_rule`. xDiT passes these
+values through without a whitelist, so the checked-out `tllm_linear_lite`
+revision is the source of truth for valid kernels and quantization modes. FP8
+dispatch similarly uses `--tllm_fp8_gemm_backend`. The tracked submodule follows
+its `main` branch; initialize and build it before selecting a tllm backend.
+On Blackwell, build FP8 and hybrid routes with
+`TLLM_LINEAR_LITE_BUILD_MODE=full` and
+`TLLM_LINEAR_LITE_ENABLE_TRTLLM_GEN=1`, allowing `auto` to select TRTLLMGen;
+cuBLASLt FP8 block scaling is not supported on SM100/SM103.
 
 `aiter_flydsl` uses a FlyDSL kernel (MLIR-compiled), validated on gfx1200+ (RDNA4). It only supports causal self-attention; non-causal and cross-attention calls automatically fall back to `sdpa_flash`.
 

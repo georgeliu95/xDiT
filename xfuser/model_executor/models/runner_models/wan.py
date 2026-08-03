@@ -49,9 +49,23 @@ COMMON_FSDP_STRATEGY = {
 
 
 def _build_attention_kwargs(config: "xFuserArgs") -> dict:
-    """Build the per-model attention_kwargs dict used by the AITER Sparge backends. """
+    """Build the per-model kwargs used by Wan sparse self-attention backends."""
     return {
         "thw": None,
+        "tile_size": [6, 8, 8],
+        "win_size": [[3, 3, 3]],
+        "ssta_topk": 64,
+        "ssta_threshold": 0.0,
+        "ssta_lambda": 0.7,
+        "ssta_sampling_type": "importance",
+        "ssta_adaptive_pool": None,
+        "attn_pad_type": "zero",
+        "attn_use_text_mask": False,
+        "text_mask": None,
+        "attn_mask_share_within_head": False,
+        "encoder_sequence_length": 0,
+        "sparse_text_to_image": False,
+        "attn_sparse_type": "ssta",
         "spargeattn_simthreshold": config.spargeattn_simthreshold,
         "spargeattn_cdfthreshold": config.spargeattn_cdfthreshold,
         "spargeattn_reorder_sequence": config.spargeattn_reorder_sequence,
@@ -184,6 +198,7 @@ class xFuserWan21I2VModel(xFuserModel):
         use_parallel_vae=True,
         use_parallel_vae_encoder=True,
         cross_attention_backend=True,
+        supports_sparse_attention_backends=True,
         supports_sparge_attention_backends=True,
         enable_tiling=True,
         enable_slicing=True,
@@ -349,6 +364,7 @@ class xFuserWan22DistilledI2VModel(xFuserWan22I2VModel):
         use_parallel_vae=True,
         use_parallel_vae_encoder=True,
         cross_attention_backend=True,
+        supports_sparse_attention_backends=True,
         supports_sparge_attention_backends=True,
         supports_distilled_weights=True,
     )
@@ -453,6 +469,7 @@ class xFuserWan21T2VModel(xFuserModel):
         use_hybrid_attn_schedule=True,
         use_parallel_vae=True,
         cross_attention_backend=True,
+        supports_sparse_attention_backends=True,
         supports_sparge_attention_backends=True,
         enable_tiling=True,
         enable_slicing=True,
@@ -580,6 +597,7 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
         use_hybrid_gemm_schedule=True,
         use_parallel_vae=True,
         cross_attention_backend=True,
+        supports_sparse_attention_backends=True,
         supports_sparge_attention_backends=True,
         enable_tiling=True,
         enable_slicing=True,
@@ -686,6 +704,7 @@ class xFuserWan21VACEModel(xFuserModel):
         ring_degree=True,
         use_fp8_gemms=True,
         cross_attention_backend=True,
+        supports_sparse_attention_backends=True,
         enable_tiling=True,
         enable_slicing=True,
         fully_shard_degree=True,
