@@ -31,7 +31,7 @@ class WanTllmRopeDispatchContractTest(unittest.TestCase):
 
         self.assertIn("AttentionBackendType.FLASHINFER_NVFP4", source)
         self.assertIn(
-            "from tllm_linear_lite.wan_qk_rope import "
+            "from tllm_linear_lite.layers.elementwise import "
             "apply_wan_qk_rotary_embedding",
             source,
         )

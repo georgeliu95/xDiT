@@ -7,17 +7,16 @@ import sys
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TllmLinearClasses:
     """Linear classes available in the installed dependency revision."""
 
-    nvfp4: type[Any]
-    fp8_blockscale: type[Any] | None
-    svdquant_fp8: type[Any] | None
-    svdquant: type[Any] | None
+    nvfp4: type
+    fp8_blockscale: type | None
+    svdquant_fp8: type | None
+    svdquant: type | None
     fp8_import_error: ImportError | None = None
     svdquant_import_error: ImportError | None = None
 
@@ -40,7 +39,7 @@ def load_tllm_linear_classes() -> TllmLinearClasses:
     """Load dependency classes only when a tllm backend is selected."""
     _add_dependency_to_path()
     try:
-        from tllm_linear_lite.nvfp4_linear import NVFP4DynamicLinear
+        from tllm_linear_lite.layers.linear import NVFP4DynamicLinear
     except ImportError as error:
         root = _dependency_root()
         raise ImportError(
@@ -50,14 +49,14 @@ def load_tllm_linear_classes() -> TllmLinearClasses:
         ) from error
 
     try:
-        from tllm_linear_lite.fp8_blockscale_linear import (
+        from tllm_linear_lite.layers.linear import (
             FP8BlockScaleDynamicLinear,
         )
     except ImportError:
         FP8BlockScaleDynamicLinear = None
 
     try:
-        from tllm_linear_lite.svdquant_fp8_linear import (
+        from tllm_linear_lite.layers.linear import (
             SVDQuantFP8BlockScaleLinear,
         )
     except ImportError as error:
@@ -67,7 +66,7 @@ def load_tllm_linear_classes() -> TllmLinearClasses:
         fp8_import_error = None
 
     try:
-        from tllm_linear_lite.svdquant_linear import SVDQuantLinear
+        from tllm_linear_lite.layers.linear import SVDQuantLinear
     except ImportError as error:
         SVDQuantLinear = None
         svdquant_import_error = error

@@ -111,7 +111,7 @@ def build_svdquant_nvfp4_linear(
     quant_module = _copy_linear_to_device(module, device)
     return module_class.from_linear(
         quant_module,
-        backend="nvfp4_fused",
+        implementation="nvfp4_fused",
         rank=options.svdquant_rank,
         alpha=options.svdquant_alpha,
         method=options.svdquant_method,

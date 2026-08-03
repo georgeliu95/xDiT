@@ -206,6 +206,41 @@ class WanBackendMigrationContractTest(unittest.TestCase):
             },
         )
 
+    def test_tllm_loader_uses_the_layer_public_api(self) -> None:
+        # Given: the dependency loader after tllm_linear_lite's package split.
+        source = (
+            ROOT / "xfuser/model_executor/quantization/tllm_loader.py"
+        ).read_text(encoding="utf-8")
+
+        # When/Then: classes come from the public Linear layer namespace.
+        self.assertIn("from tllm_linear_lite.layers.linear import", source)
+        self.assertNotIn("from tllm_linear_lite.nvfp4_linear import", source)
+        self.assertNotIn("from tllm_linear_lite.svdquant_linear import", source)
+
+    def test_tllm_svdquant_selects_an_implementation(self) -> None:
+        # Given: the dependency's implementation-selecting SVDQuant factory.
+        builder = _function(
+            "xfuser/model_executor/quantization/tllm_builders.py",
+            "build_svdquant_nvfp4_linear",
+        )
+
+        # When: the factory arguments are inspected.
+        factory = next(
+            call
+            for call in ast.walk(builder)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "from_linear"
+        )
+        keyword_values = {
+            keyword.arg: ast.literal_eval(keyword.value)
+            for keyword in factory.keywords
+            if keyword.arg in {"backend", "implementation"}
+        }
+
+        # Then: xDiT uses the renamed public selector without the legacy key.
+        self.assertEqual(keyword_values, {"implementation": "nvfp4_fused"})
+
     def test_wan_image_context_uses_cross_attention_backend(self) -> None:
         # Given: Wan's added image-context attention path.
         call = _function(

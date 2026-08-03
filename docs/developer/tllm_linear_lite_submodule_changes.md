@@ -1,14 +1,14 @@
 # `tllm_linear_lite` Submodule Policy
 
-Updated: 2026-07-31
+Updated: 2026-08-03
 
 ## Current State
 
 - Path: `third_party/tllm_linear_lite`
 - Upstream: `https://github.com/georgeliu95/tllm_linear_lite.git`
 - Update branch: `main`
-- Recorded commit: `39b646162f101ea0884cb895a9a0dab103c1b886`
-- Recorded commit subject: `Refactor SVDQuant NVFP4 M-tail contracts`
+- Recorded commit: `81ceab3b3d3e57293c674140219758ac9d3c6b38`
+- Recorded commit subject: `Refactor package into layers and ops`
 - Nested CUTLASS commit: `e64a9136dd929639e5f7c969fe5af3bf7415cd4f`
 - Submodule worktree: clean
 
@@ -24,6 +24,30 @@ Initialize the recorded dependency and its nested submodules:
 ```bash
 git submodule update --init --recursive
 ```
+
+## Blackwell Build and Validation Environment
+
+The full NVFP4, FP8 block-scale, and fused SVDQuant paths require CUDA Toolkit
+13.1 or newer. On B200/GB200 (SM100), materialize the TRTLLMGen Git-LFS cubins
+before building; pointer files are rejected rather than silently embedded:
+
+```bash
+git lfs install
+git -C third_party/tllm_linear_lite lfs pull
+
+CUDA_HOME=/usr/local/cuda \
+TLLM_LINEAR_LITE_BUILD_MODE=full \
+TLLM_LINEAR_LITE_ENABLE_TRTLLM_GEN=1 \
+TORCH_CUDA_ARCH_LIST="10.0a" \
+  pip install -e "third_party/tllm_linear_lite[cutedsl,trtllm_gen]" \
+    --no-build-isolation
+```
+
+The `cutedsl` extra installs `nvidia-cutlass-dsl[cu13]>=4.6.1`. Do not rely on
+an older CuTe DSL already present in the container: version 4.4.2 does not
+export `OperandMajorMode` from `cutlass.cute.nvgpu`, so the fused SVDQuant
+NVFP4 implementation fails during import. When TRTLLMGen is compiled, the
+FP8 block-scale `auto` backend selects it on SM100/SM103.
 
 ## Refresh to the Latest `main`
 

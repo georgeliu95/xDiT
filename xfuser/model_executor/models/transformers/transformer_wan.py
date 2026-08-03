@@ -127,7 +127,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             == AttentionBackendType.FLASHINFER_NVFP4
             and query.shape[0] == 1
         ):
-            from tllm_linear_lite.wan_qk_rope import apply_wan_qk_rotary_embedding
+            from tllm_linear_lite.layers.elementwise import apply_wan_qk_rotary_embedding
 
             query, key = apply_wan_qk_rotary_embedding(
                 query,

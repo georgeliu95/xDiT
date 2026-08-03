@@ -390,6 +390,9 @@ On Blackwell, build FP8 and hybrid routes with
 `TLLM_LINEAR_LITE_BUILD_MODE=full` and
 `TLLM_LINEAR_LITE_ENABLE_TRTLLM_GEN=1`, allowing `auto` to select TRTLLMGen;
 cuBLASLt FP8 block scaling is not supported on SM100/SM103.
+See the
+[`tllm_linear_lite` submodule policy](./docs/developer/tllm_linear_lite_submodule_changes.md)
+for Git-LFS, CuTe DSL, and architecture-specific build requirements.
 
 `aiter_flydsl` uses a FlyDSL kernel (MLIR-compiled), validated on gfx1200+ (RDNA4). It only supports causal self-attention; non-causal and cross-attention calls automatically fall back to `sdpa_flash`.
 
