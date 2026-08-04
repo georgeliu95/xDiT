@@ -58,6 +58,8 @@ def flashinfer_attention(
 
 def _sage_function(
     implementation: SageImplementation,
+    *,
+    device: torch.device,
 ) -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
     import sageattention
 
@@ -65,6 +67,8 @@ def _sage_function(
         case SageImplementation.FP16:
             return sageattention.sageattn_qk_int8_pv_fp16_cuda
         case SageImplementation.FP8:
+            if torch.cuda.get_device_capability(device) == (9, 0):
+                return sageattention.sageattn_qk_int8_pv_fp8_cuda_sm90
             return sageattention.sageattn_qk_int8_pv_fp8_cuda
         case SageImplementation.FP8_SM90:
             return sageattention.sageattn_qk_int8_pv_fp8_cuda_sm90
@@ -82,7 +86,7 @@ def sage_attention(
     implementation: SageImplementation,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run an explicit SageAttention implementation for BHSD inputs."""
-    function = _sage_function(implementation)
+    function = _sage_function(implementation, device=query.device)
     kwargs = {
         "is_causal": is_causal,
         "tensor_layout": "NHD",
