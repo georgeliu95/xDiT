@@ -74,6 +74,7 @@ class xFuserArgs:
 
     # Model arguments
     model: str = ""
+    weights_locator: Optional[str] = None
     download_dir: Optional[str] = None
     trust_remote_code: bool = False
     # Runtime arguments

@@ -58,13 +58,14 @@ class xFuserQwenImageEditModel(xFuserModel):
             self.settings.output_name = "qwen_image_edit_2509"
 
     def _load_model(self) -> DiffusionPipeline:
+        weights_source = self.config.weights_locator or self.settings.model_name
         transformer = xFuserQwenImageTransformerWrapper.from_pretrained(
-            self.settings.model_name,
+            weights_source,
             torch_dtype=torch.bfloat16,
             subfolder="transformer",
         )
         pipe = QwenImageEditPipeline.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
+            pretrained_model_name_or_path=weights_source,
             transformer=transformer,
             torch_dtype=torch.bfloat16,
         )
@@ -77,6 +78,7 @@ class xFuserQwenImageEditModel(xFuserModel):
             "negative_prompt": input_args["negative_prompt"],
             "num_inference_steps": input_args["num_inference_steps"],
             "true_cfg_scale": input_args["guidance_scale"],
+            "max_sequence_length": input_args["max_sequence_length"],
             "generator": torch.Generator(device="cuda").manual_seed(input_args["seed"]),
         }
         if "height" in input_args: kwargs["height"] = input_args["height"]
@@ -133,13 +135,14 @@ class xFuserQwenImageModel(xFuserModel):
             self.settings.output_name = "qwen_image_2512"
 
     def _load_model(self) -> DiffusionPipeline:
+        weights_source = self.config.weights_locator or self.settings.model_name
         transformer = xFuserQwenImageTransformerWrapper.from_pretrained(
-            self.settings.model_name,
+            weights_source,
             torch_dtype=torch.bfloat16,
             subfolder="transformer",
         )
         pipe = QwenImagePipeline.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
+            pretrained_model_name_or_path=weights_source,
             transformer=transformer,
             torch_dtype=torch.bfloat16,
         )
@@ -153,6 +156,7 @@ class xFuserQwenImageModel(xFuserModel):
             "negative_prompt": input_args["negative_prompt"],
             "num_inference_steps": input_args["num_inference_steps"],
             "true_cfg_scale": input_args["guidance_scale"],
+            "max_sequence_length": input_args["max_sequence_length"],
             "generator": torch.Generator(device="cuda").manual_seed(input_args["seed"]),
         }
 

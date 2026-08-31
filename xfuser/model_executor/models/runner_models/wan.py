@@ -556,20 +556,21 @@ class xFuserWan22T2VModel(xFuserWan21T2VModel):
         self.settings.fp8_precision_overrides=None
 
     def _load_model(self) -> DiffusionPipeline:
+        weights_source = self.config.weights_locator or self.settings.model_name
         transformer = xFuserWanTransformer3DWrapper.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
+            pretrained_model_name_or_path=weights_source,
             torch_dtype=torch.bfloat16,
             subfolder="transformer",
             attention_kwargs=_build_attention_kwargs(self.config),
         )
         transformer_2 = xFuserWanTransformer3DWrapper.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
+            pretrained_model_name_or_path=weights_source,
             torch_dtype=torch.bfloat16,
             subfolder="transformer_2",
             attention_kwargs=_build_attention_kwargs(self.config),
         )
         pipe = WanPipeline.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
+            pretrained_model_name_or_path=weights_source,
             torch_dtype=torch.bfloat16,
             transformer=transformer,
             transformer_2=transformer_2,
