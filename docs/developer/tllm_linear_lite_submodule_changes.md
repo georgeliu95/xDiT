@@ -1,14 +1,14 @@
 # `tllm_linear_lite` Submodule Policy
 
-Updated: 2026-08-03
+Updated: 2026-08-31
 
 ## Current State
 
 - Path: `third_party/tllm_linear_lite`
 - Upstream: `https://github.com/georgeliu95/tllm_linear_lite.git`
 - Update branch: `main`
-- Recorded commit: `81ceab3b3d3e57293c674140219758ac9d3c6b38`
-- Recorded commit subject: `Refactor package into layers and ops`
+- Recorded commit: `7dccdc0846b5953cec00d94d0b336eac6d2749c4`
+- Recorded commit subject: `Remove internal artifacts from docs`
 - Nested CUTLASS commit: `e64a9136dd929639e5f7c969fe5af3bf7415cd4f`
 - Submodule worktree: clean
 
